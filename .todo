@@ -1,0 +1,14 @@
+Add the following data feeds for the rendered nodes. We're using shokupan@0.16.7 as the sample -- don't hardcode that.
+
+https://ungh.cc/repos/knackstedt/shokupan
+
+
+
+
+
+// ?
+https://bundlephobia.com/api/size?package=negotiator%401.0.0
+
+https://libraries.io/api
+
+https://repology.org
