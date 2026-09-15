@@ -23,7 +23,7 @@ export interface ComparisonSide {
 export interface ComparisonViewProps {
     left: ComparisonSide;
     right: ComparisonSide;
-    onNodeClick: (side: 'left' | 'right', nodeId: string | null) => void;
+    onNodeClick?: (side: 'left' | 'right', nodeId: string | null) => void;
     fitViewSignalLeft?: number;
     fitViewSignalRight?: number;
 }
@@ -72,11 +72,11 @@ export function ComparisonView({ left, right, onNodeClick, fitViewSignalLeft, fi
     }, [handleMouseUp, handleMouseMove]);
 
     const handleLeftNodeClick = useCallback((nodeId: string | null) => {
-        onNodeClick('left', nodeId);
+        onNodeClick?.('left', nodeId);
     }, [onNodeClick]);
 
     const handleRightNodeClick = useCallback((nodeId: string | null) => {
-        onNodeClick('right', nodeId);
+        onNodeClick?.('right', nodeId);
     }, [onNodeClick]);
 
     // Calculate diff between left and right dependency trees

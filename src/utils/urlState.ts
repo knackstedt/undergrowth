@@ -1,4 +1,5 @@
 import type { WarningToggles } from '../components/WarningTogglesPanel';
+import { MICROPACKAGE_SIZE_THRESHOLD } from '../graph/resolver';
 
 export interface ViewportState {
     x: number;
@@ -354,7 +355,7 @@ export function buildURL(
             params.set('f', encodeFilters(filters, showPeerDeps));
             setNonOsiLicensesParam(params, filters);
         }
-        if (micropackageThreshold !== undefined && micropackageThreshold !== 6144) {
+        if (micropackageThreshold !== undefined && micropackageThreshold !== MICROPACKAGE_SIZE_THRESHOLD) {
             params.set('mpt', String(Math.round(micropackageThreshold / 1024)));
         }
 
@@ -371,7 +372,7 @@ export function buildURL(
             params.set('f', encodeFilters(filters, showPeerDeps));
             setNonOsiLicensesParam(params, filters);
         }
-        if (micropackageThreshold !== undefined && micropackageThreshold !== 6144) {
+        if (micropackageThreshold !== undefined && micropackageThreshold !== MICROPACKAGE_SIZE_THRESHOLD) {
             params.set('mpt', String(Math.round(micropackageThreshold / 1024)));
         }
 
@@ -392,7 +393,7 @@ export function buildURL(
         params.set('f', encodeFilters(filters, showPeerDeps));
         setNonOsiLicensesParam(params, filters);
     }
-    if (micropackageThreshold !== undefined && micropackageThreshold !== 6144) {
+    if (micropackageThreshold !== undefined && micropackageThreshold !== MICROPACKAGE_SIZE_THRESHOLD) {
         params.set('mpt', String(Math.round(micropackageThreshold / 1024)));
     }
 

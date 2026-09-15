@@ -232,7 +232,9 @@ export function resolvePythonVersion(
     availableVersions: string[]
 ): string {
     const sorted = [...availableVersions].sort(comparePythonVersions);
-    const latest = sorted[sorted.length - 1];
+    // "Latest" means the latest stable release, matching PyPI's notion —
+    // prereleases only surface via an explicit specifier.
+    const latest = sorted.filter(v => !isPythonPrerelease(v)).pop() ?? sorted[sorted.length - 1];
 
     if (!specifier || specifier === '*' || specifier === 'latest') {
         return latest;

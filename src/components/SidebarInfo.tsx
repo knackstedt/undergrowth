@@ -2,6 +2,8 @@ import { Archive, Download, ExternalLink, GitCommit, Link as LinkIcon, Users, X 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { getDownloads } from '../api/npm';
 import type { DependencySource, GraphNodeData } from '../graph/resolver';
+import { MICROPACKAGE_SIZE_THRESHOLD } from '../graph/resolver';
+import { formatBytes } from '../utils/format';
 
 import ReactMarkdown from 'react-markdown';
 import rehypeSanitize from 'rehype-sanitize';
@@ -30,7 +32,7 @@ const MIN_SIDEBAR_WIDTH = 350;
 const DEFAULT_SIDEBAR_WIDTH = 480;
 const MAX_SIDEBAR_WIDTH = 800;
 
-export function SidebarInfo({ nodeData, micropackageThreshold = 6144, isOpen, onClose }: SidebarInfoProps) {
+export function SidebarInfo({ nodeData, micropackageThreshold = MICROPACKAGE_SIZE_THRESHOLD, isOpen, onClose }: SidebarInfoProps) {
     const [downloads, setDownloads] = useState<number | null>(null);
     const [width, setWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
     const isResizing = useRef(false);
@@ -89,14 +91,6 @@ export function SidebarInfo({ nodeData, micropackageThreshold = 6144, isOpen, on
         : (nodeData?.source && nodeData.source !== 'npm' ? 'N/A' : 'Loading...');
 
     const depsCount = Object.keys(nodeData?.dependencies || {}).length;
-
-    function formatBytes(bytes: number): string {
-        if (bytes === 0) return '0 B';
-        const k = 1024;
-        const sizes = ['B', 'KB', 'MB', 'GB'];
-        const i = Math.floor(Math.log(bytes) / Math.log(k));
-        return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
-    }
 
     const sizeStr = nodeData?.size !== undefined ? formatBytes(nodeData.size) : 'Unknown';
 

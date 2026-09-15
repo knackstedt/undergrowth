@@ -8,7 +8,7 @@ export type ElkEdgeData = Edge<
 	"elk"
 >;
 
-const getRoundedPath = (points, radius = 10) => {
+const getRoundedPath = (points: Array<{ x: number; y: number }>, radius = 10) => {
 	if (points.length < 2) return "";
 	if (points.length === 2) {
 		return `M${points[0].x},${points[0].y} L${points[1].x},${points[1].y}`;
@@ -48,7 +48,7 @@ const getRoundedPath = (points, radius = 10) => {
 
 export function ElkEdge(props: EdgeProps<ElkEdgeData>) {
 	const { data, id, markerEnd, style } = props;
-	const { startPoint, endPoint, bendPoints = [] } = data.path || {};
+	const { startPoint, endPoint, bendPoints = [] } = data?.path || {};
 
 	if (!startPoint || !endPoint) return null;
 

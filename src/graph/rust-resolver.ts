@@ -146,7 +146,7 @@ async function runBfsRustResolution(
                     downloads: versionData?.downloads || meta.crate.downloads,
                     dependencies: dependencies,
                     isRoot: parentId === null,
-                    readme: meta.crate.readme,
+                    readme: meta.crate.readme ?? undefined,
                     source: detectRustSource(name, versionDef),
                     size,
                     isMicropackage: size !== undefined && size > 0 && size < MICROPACKAGE_SIZE_THRESHOLD

@@ -18,7 +18,7 @@ import { parseRequirementsTxt } from './api/pypi';
 import { layoutGraph } from './graph/layout';
 import {resolvePythonDependencyTreeFromManifest} from './graph/python-resolver';
 import type { GraphNodeData, ResolvedGraph } from './graph/resolver';
-import {enrichGraphWithDepsDevData, resolveDependencyTree} from './graph/resolver';
+import {enrichGraphWithDepsDevData, MICROPACKAGE_SIZE_THRESHOLD, resolveDependencyTree} from './graph/resolver';
 import { buildTimelineFromVersions, type TimelineVersion } from './graph/timeline';
 import { detectManifestUrl, fetchManifestFromUrl, parseManifestContent } from './utils/fetchManifest';
 import { isAbortError, PermanentError } from './utils/retry';
@@ -56,8 +56,7 @@ function App() {
   });
   const [fitViewSignalLeft, setFitViewSignalLeft] = useState(0);
   const [fitViewSignalRight, setFitViewSignalRight] = useState(0);
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const [_comparisonSelectedNode, setComparisonSelectedNode] = useState<{ side: 'left' | 'right'; nodeId: string } | null>(null);
+
   const [searchInput, setSearchInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [selectedNode, setSelectedNode] = useState<string | null>(null);
@@ -94,7 +93,7 @@ function App() {
     nonOsiLicense: { enabled: false, licenses: '' },
     staleTopLevel: false
   });
-  const [micropackageThreshold, setMicropackageThreshold] = useState(6144);
+  const [micropackageThreshold, setMicropackageThreshold] = useState(MICROPACKAGE_SIZE_THRESHOLD);
 
   // Graph search state
   const [graphSearchQuery, setGraphSearchQuery] = useState('');
@@ -125,12 +124,14 @@ function App() {
       progress: { resolved: 0, total: 1 }
     }));
 
+    let lastProgress = { resolved: 0, total: 0 };
     const onProgress = (resolved: number, total: number) => {
+      lastProgress = { resolved, total };
       setSideData(prev => ({ ...prev, progress: { resolved, total } }));
     };
 
     try {
-      let tree;
+      let tree: ResolvedGraph | undefined;
       const registry = spec.source;
 
       if (spec.type === 'file' && spec.fileContent) {
@@ -199,6 +200,9 @@ function App() {
 
       setSideData(prev => ({ ...prev, loadingLabel: 'Computing layout…' }));
 
+      if (!tree) {
+        throw new Error(`Unsupported manifest or registry: ${registry}`);
+      }
       const layout = await layoutGraph(tree);
 
       setSideData({
@@ -207,7 +211,7 @@ function App() {
         nodes: layout.nodes,
         edges: layout.edges,
         isLoading: false,
-        progress: { resolved: tree.resolvedCount, total: tree.totalCount },
+        progress: lastProgress,
         loadingLabel: '',
         error: null
       });
@@ -260,16 +264,8 @@ function App() {
     ]);
   };
 
-  const handleComparisonNodeClick = useCallback((side: 'left' | 'right', nodeId: string | null) => {
-    if (nodeId) {
-      setComparisonSelectedNode({ side, nodeId });
-    } else {
-      setComparisonSelectedNode(null);
-    }
-  }, []);
-
-  // Restore state from URL on mount
-  useEffect(() => {
+  // Restore state from URL — runs on mount and on hashchange (back/forward nav)
+  function restoreFromUrl() {
     const urlState = parseURLState();
     if (urlState) {
       // Check for comparison mode first
@@ -334,10 +330,6 @@ function App() {
           setComparisonLeftData(prev => ({ ...prev, isLoading: true, loadingLabel: 'Resolving dependencies…' }));
           setComparisonRightData(prev => ({ ...prev, isLoading: true, loadingLabel: 'Resolving dependencies…' }));
 
-          // Generate both graphs using local specs, not state
-          setComparisonLeftData(prev => ({ ...prev, isLoading: true, loadingLabel: 'Resolving dependencies…' }));
-          setComparisonRightData(prev => ({ ...prev, isLoading: true, loadingLabel: 'Resolving dependencies…' }));
-
           Promise.all([
             generateComparisonGraph(leftSpec, 'left', setComparisonLeftData),
             generateComparisonGraph(rightSpec, 'right', setComparisonRightData)
@@ -356,7 +348,7 @@ function App() {
         setManifestUrl(urlState.manifestUrl);
         // Defer fetching to avoid calling function before declaration
         setTimeout(() => {
-          fetchAndGraphManifest(urlState.manifestUrl!, urlState.ecosystem);
+          fetchAndGraphManifest(urlState.manifestUrl!, urlState.ecosystem ?? 'npm');
         }, 0);
       } else if (urlState.package) {
         const identifier = buildPackageIdentifier(urlState.package, urlState.version);
@@ -378,6 +370,14 @@ function App() {
         generateGraph(urlState.package, urlState.ecosystem, urlState.version, urlState.showPeerDeps);
       }
     }
+  }
+
+  useEffect(() => {
+    restoreFromUrl();
+    // history.replaceState doesn't fire hashchange, so this only runs
+    // on real back/forward navigation or manual hash edits
+    window.addEventListener('hashchange', restoreFromUrl);
+    return () => window.removeEventListener('hashchange', restoreFromUrl);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -587,7 +587,6 @@ function App() {
         loadingLabel: '',
         error: null
       });
-      setComparisonSelectedNode(null);
       // Clear the URL hash
       window.history.replaceState(null, '', '#');
     }
@@ -790,7 +789,6 @@ function App() {
           loadingLabel: '',
           error: null
         });
-        setComparisonSelectedNode(null);
         // Clear the URL hash
         window.history.replaceState(null, '', '#');
       }
@@ -1374,7 +1372,7 @@ function App() {
               disabled={!lastSearchedInput || lastSearchedRegistry !== 'npm' || isLoading}
               title={lastSearchedRegistry !== 'npm' ? 'Timeline mode currently only supports npm' : 'View historical timeline'}
               style={{
-                display: 'none',
+                display: 'flex',
                 alignItems: 'center',
                 gap: '6px',
                 padding: '6px 12px',
@@ -1470,7 +1468,6 @@ function App() {
                 <ComparisonView
                   left={comparisonLeftData}
                   right={comparisonRightData}
-                  onNodeClick={handleComparisonNodeClick}
                   fitViewSignalLeft={fitViewSignalLeft}
                   fitViewSignalRight={fitViewSignalRight}
                 />
@@ -1496,7 +1493,6 @@ function App() {
                     });
                     setComparisonLeftSpec(null);
                     setComparisonRightSpec(null);
-                    setComparisonSelectedNode(null);
                     // Clear the URL hash
                     window.history.replaceState(null, '', '#');
                   }}

@@ -4,6 +4,8 @@ import { flip, FloatingPortal, offset, safePolygon, shift, size, useFloating, us
 import { AlertTriangle, CircleAlert, ExternalLink, GitBranch, Github, Gitlab, Loader2, Package } from 'lucide-react';
 import { memo, useCallback, useState } from 'react';
 import type { DependencySource, GraphNodeData } from '../graph/resolver';
+import { MICROPACKAGE_SIZE_THRESHOLD } from '../graph/resolver';
+import { formatBytes } from '../utils/format';
 import { useNodeVisibility } from './useNodeVisibility';
 import type { WarningToggles } from './WarningTogglesPanel';
 
@@ -148,14 +150,6 @@ const OSI_APPROVED_LICENSES: readonly string[] = [
     'afl-3.0', 'afl-2.1', 'afl-2.0', 'afl-1.2', 'afl-1.1'
 ];
 
-function formatBytes(bytes: number): string {
-    if (bytes === 0) return '0 B';
-    const k = 1024;
-    const sizes = ['B', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
-}
-
 const SourceIcon = ({ source, size = 16, color }: { source?: DependencySource, size?: number, color?: string }) => {
     switch (source) {
         case 'github':
@@ -252,7 +246,7 @@ export const CustomNode = memo(function CustomNode({ data, selected, positionAbs
     const isDedicated = relationship === 'dedicated';
     const isPeer = data.isPeer;
     const isPythonRoot = data.isPythonRoot;
-    const micropackageThreshold = (data.micropackageThreshold as number | undefined) ?? 6144;
+    const micropackageThreshold = (data.micropackageThreshold as number | undefined) ?? MICROPACKAGE_SIZE_THRESHOLD;
     const isMicropackage = data.size !== undefined && data.size > 0 && data.size < micropackageThreshold;
 
     // Comparison diff status

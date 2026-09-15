@@ -1,5 +1,6 @@
 import { Info, Settings } from 'lucide-react';
 import { useState } from 'react';
+import { MICROPACKAGE_SIZE_THRESHOLD } from '../graph/resolver';
 
 export interface WarningToggles {
     maxDependencies: { enabled: boolean; value: number };
@@ -23,7 +24,7 @@ interface WarningTogglesPanelProps {
     onMicropackageThresholdChange?: (bytes: number) => void;
 }
 
-export function WarningTogglesPanel({ toggles, onToggleChange, micropackageThreshold = 6144, onMicropackageThresholdChange }: WarningTogglesPanelProps) {
+export function WarningTogglesPanel({ toggles, onToggleChange, micropackageThreshold = MICROPACKAGE_SIZE_THRESHOLD, onMicropackageThresholdChange }: WarningTogglesPanelProps) {
     const [isOpen, setIsOpen] = useState(false);
 
     const handleToggle = (key: keyof WarningToggles) => {
@@ -416,26 +417,8 @@ export function WarningTogglesPanel({ toggles, onToggleChange, micropackageThres
                             Stale direct deps (no updates + outdated)
                         </label>
 
-                        {/* Untyped packages */}
-                        {/* <label style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: '8px',
-                            cursor: 'pointer',
-                            fontSize: '13px',
-                            color: 'var(--text-primary)'
-                        }}>
-                            <input
-                                type="checkbox"
-                                checked={toggles.typedOnly}
-                                onChange={() => handleToggle('typedOnly')}
-                                style={{ cursor: 'pointer' }}
-                            />
-                            Untyped packages
-                        </label> */}
-
                         {/* ESM Only */}
-                        {/* <label style={{
+                        <label style={{
                             display: 'flex',
                             alignItems: 'center',
                             gap: '8px',
@@ -450,10 +433,10 @@ export function WarningTogglesPanel({ toggles, onToggleChange, micropackageThres
                                 style={{ cursor: 'pointer' }}
                             />
                             ESM only
-                        </label> */}
+                        </label>
 
                         {/* CJS Only */}
-                        {/* <label style={{
+                        <label style={{
                             display: 'flex',
                             alignItems: 'center',
                             gap: '8px',
@@ -468,7 +451,7 @@ export function WarningTogglesPanel({ toggles, onToggleChange, micropackageThres
                                 style={{ cursor: 'pointer' }}
                             />
                             CJS only
-                        </label> */}
+                        </label>
                     </div>
                 </div>
             )}

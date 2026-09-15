@@ -90,10 +90,11 @@ self.onmessage = async (e: MessageEvent<{
         const layoutedGraph = await elk.layout(graph as unknown as ElkNode);
 
         // Transform back to React Flow format
-        const reactFlowNodes = (layoutedGraph.children || []).map((node) => {
+        const reactFlowNodes = (layoutedGraph.children || []).flatMap((node) => {
             const delay = Math.min((node.x || 0) / 1000, 1.5);
             const originalData = (node as ElkNode & { data?: GraphNodeData }).data;
-            return {
+            if (!originalData) return [];
+            return [{
                 id: originalData.id, // Use the ORIGINAL ID (e.g., "react@18.2.0") not the safe ID
                 position: { x: node.x || 0, y: node.y || 0 },
                 data: originalData,
@@ -103,7 +104,7 @@ self.onmessage = async (e: MessageEvent<{
                     ...((originalData as GraphNodeData & { style?: React.CSSProperties }).style || {}),
                     animation: `fadeIn 0.5s ease both ${delay}s`
                 }
-            };
+            }];
         });
 
         const safeReactFlowEdges = (layoutedGraph.edges || []).map((elkEdge: ElkExtendedEdge) => {
