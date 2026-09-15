@@ -106,7 +106,14 @@ export async function fetchPackageMeta(name: string, signal?: AbortSignal): Prom
                     deprecated: pkg.deprecated,
                     dependencies: pkg.dependencies,
                     peerDependencies: pkg.peerDependencies,
+                    repository: pkg.repository,
                     maintainers: pkg.maintainers,
+                    type: pkg.type,
+                    exports: pkg.exports,
+                    main: pkg.main,
+                    module: pkg.module,
+                    types: pkg.types,
+                    typings: pkg.typings,
                     dist: pkg.dist,
                     license: licenseStr
                 };

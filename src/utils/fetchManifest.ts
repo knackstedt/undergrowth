@@ -1,24 +1,16 @@
 import { parseGoMod } from '../api/go';
 import { parseRequirementsTxt } from '../api/pypi';
 import type { CsprojManifest } from '../graph/csharp-resolver';
+import type { CargoManifest } from '../graph/rust-resolver';
+import type { GoModManifest } from '../graph/go-resolver';
+import type { PythonRequirementsManifest } from '../graph/python-resolver';
+import type { LocalManifest } from '../graph/resolver';
 
-export interface CargoManifest {
-    name: string;
-    version?: string;
-    description?: string;
-    dependencies: Record<string, string>;
-}
-
-export interface GoModManifest {
-    name: string;
-    version?: string;
-    description?: string;
-    dependencies: Record<string, string>;
-}
+export type { CargoManifest, GoModManifest };
 
 export type FetchedManifest =
-    | { type: 'npm'; data: { name: string; version?: string; description?: string; dependencies: Record<string, string>; devDependencies?: Record<string, string>; peerDependencies?: Record<string, string> } }
-    | { type: 'pypi'; data: { name: string; version: string; description: string; dependencies: Record<string, string> } }
+    | { type: 'npm'; data: LocalManifest }
+    | { type: 'pypi'; data: PythonRequirementsManifest }
     | { type: 'crates'; data: CargoManifest }
     | { type: 'go'; data: GoModManifest }
     | { type: 'nuget'; data: CsprojManifest }
@@ -69,6 +61,19 @@ export function detectManifestUrl(input: string): { type: 'npm' | 'pypi' | 'crat
     } catch {
         return null;
     }
+}
+
+/**
+ * Detect the ecosystem a dropped/local manifest file belongs to from its
+ * filename. Returns null for unrecognized files.
+ */
+export function detectManifestFileName(name: string): 'npm' | 'pypi' | 'crates' | 'go' | 'nuget' | null {
+    if (name === 'package.json') return 'npm';
+    if (name === 'requirements.txt' || name.endsWith('.txt')) return 'pypi';
+    if (name === 'Cargo.toml') return 'crates';
+    if (name === 'go.mod') return 'go';
+    if (name.endsWith('.csproj')) return 'nuget';
+    return null;
 }
 
 /**

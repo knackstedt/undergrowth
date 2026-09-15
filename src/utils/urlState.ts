@@ -332,20 +332,34 @@ export function decodeCompareState(encoded: string): CompareState | null {
     }
 }
 
+export interface URLBuildOptions {
+    ecosystem: 'npm' | 'pypi' | 'crates' | 'go' | 'nuget';
+    pkg?: string;
+    filters?: WarningToggles;
+    viewport?: ViewportState;
+    showPeerDeps?: boolean;
+    version?: string;
+    manifestUrl?: string;
+    compare?: CompareState;
+    micropackageThreshold?: number;
+}
+
 /**
  * Build URL from state components
  */
-export function buildURL(
-    ecosystem: 'npm' | 'pypi' | 'crates' | 'go' | 'nuget',
-    pkg: string,
-    filters?: WarningToggles,
-    viewport?: ViewportState,
-    showPeerDeps?: boolean,
-    version?: string,
-    manifestUrl?: string,
-    compare?: CompareState,
-    micropackageThreshold?: number
-): string {
+export function buildURL(opts: URLBuildOptions): string {
+    const {
+        ecosystem,
+        pkg,
+        filters,
+        viewport,
+        showPeerDeps,
+        version,
+        manifestUrl,
+        compare,
+        micropackageThreshold
+    } = opts;
+
     // If compare state is provided, use compare mode
     if (compare) {
         const params = new URLSearchParams();
@@ -383,7 +397,7 @@ export function buildURL(
         return `#?${params.toString()}`;
     }
 
-    const identifier = buildPackageIdentifier(pkg, version);
+    const identifier = buildPackageIdentifier(pkg || '', version);
     const encodedPkg = encodeURIComponent(identifier);
     const path = `${ecosystem}/${encodedPkg}`;
 
@@ -408,18 +422,8 @@ export function buildURL(
 /**
  * Update browser URL without navigation
  */
-export function updateURL(
-    ecosystem: 'npm' | 'pypi' | 'crates' | 'go' | 'nuget',
-    pkg: string,
-    filters?: WarningToggles,
-    viewport?: ViewportState,
-    showPeerDeps?: boolean,
-    version?: string,
-    manifestUrl?: string,
-    compare?: CompareState,
-    micropackageThreshold?: number
-): void {
-    const url = buildURL(ecosystem, pkg, filters, viewport, showPeerDeps, version, manifestUrl, compare, micropackageThreshold);
+export function updateURL(opts: URLBuildOptions): void {
+    const url = buildURL(opts);
     window.history.replaceState(null, '', url);
 }
 

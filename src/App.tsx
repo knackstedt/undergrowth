@@ -12,20 +12,29 @@ import { WarningTogglesPanel, type WarningToggles } from './components/WarningTo
 import { ViewportContext } from './components/viewportContext';
 import { buildPackageIdentifier, buildURL, parsePackageVersion, parseURLState, updateURL, type CompareState } from './utils/urlState';
 
-import { parseGoMod } from './api/go';
+import { enrichGraph, loadEcosystem } from './graph/ecosystems';
+import { computeHighlightedGraph } from './graph/highlight';
 import { fetchPackageMeta } from './api/npm';
-import { parseRequirementsTxt } from './api/pypi';
 import { layoutGraph } from './graph/layout';
-import {resolvePythonDependencyTreeFromManifest} from './graph/python-resolver';
+import { detectManifestFileName, detectManifestUrl, fetchManifestFromUrl, parseManifestContent } from './utils/fetchManifest';
 import type { GraphNodeData, ResolvedGraph } from './graph/resolver';
-import {enrichGraphWithDepsDevData, MICROPACKAGE_SIZE_THRESHOLD, resolveDependencyTree} from './graph/resolver';
+import { MICROPACKAGE_SIZE_THRESHOLD } from './graph/resolver';
 import { buildTimelineFromVersions, type TimelineVersion } from './graph/timeline';
-import { detectManifestUrl, fetchManifestFromUrl, parseManifestContent } from './utils/fetchManifest';
 import { isAbortError, PermanentError } from './utils/retry';
 
 type NodeRelationship = 'selected' | 'upstream' | 'downstream' | 'dedicated' | 'both' | 'dimmed';
 type AppGraphNode = Node<Record<string, unknown> & GraphNodeData & { relationship?: NodeRelationship; searchMatch?: boolean; }>;
 type AppGraphEdge = Edge;
+
+const emptyComparisonSide = (): ComparisonSide => ({
+  title: '',
+  nodes: [],
+  edges: [],
+  isLoading: false,
+  progress: { resolved: 0, total: 0 },
+  loadingLabel: '',
+  error: null
+});
 
 function App() {
   // Timeline mode state
@@ -36,24 +45,8 @@ function App() {
   const [isComparisonMode, setIsComparisonMode] = useState(false);
   const [comparisonLeftSpec, setComparisonLeftSpec] = useState<ComparisonSpec | null>(null);
   const [comparisonRightSpec, setComparisonRightSpec] = useState<ComparisonSpec | null>(null);
-  const [comparisonLeftData, setComparisonLeftData] = useState<ComparisonSide>({
-    title: '',
-    nodes: [],
-    edges: [],
-    isLoading: false,
-    progress: { resolved: 0, total: 0 },
-    loadingLabel: '',
-    error: null
-  });
-  const [comparisonRightData, setComparisonRightData] = useState<ComparisonSide>({
-    title: '',
-    nodes: [],
-    edges: [],
-    isLoading: false,
-    progress: { resolved: 0, total: 0 },
-    loadingLabel: '',
-    error: null
-  });
+  const [comparisonLeftData, setComparisonLeftData] = useState<ComparisonSide>(emptyComparisonSide);
+  const [comparisonRightData, setComparisonRightData] = useState<ComparisonSide>(emptyComparisonSide);
   const [fitViewSignalLeft, setFitViewSignalLeft] = useState(0);
   const [fitViewSignalRight, setFitViewSignalRight] = useState(0);
 
@@ -131,78 +124,29 @@ function App() {
     };
 
     try {
-      let tree: ResolvedGraph | undefined;
       const registry = spec.source;
+      const driver = await loadEcosystem(registry);
 
+      let tree: ResolvedGraph;
       if (spec.type === 'file' && spec.fileContent) {
         // Handle file-based specs
         const manifest = parseManifestContent(spec.fileContent, registry, spec.name || 'manifest');
         if (!manifest) {
           throw new Error(`Unsupported registry: ${registry}`);
         }
-        if (manifest.type === 'npm') {
-          const { resolveDependencyTreeFromManifest } = await import('./graph/resolver');
-          tree = await resolveDependencyTreeFromManifest(manifest.data, { showPeerDeps, signal }, onProgress);
-        } else if (manifest.type === 'pypi') {
-          const {resolvePythonDependencyTreeFromManifest, enrichPythonGraphWithDepsDevData} = await import('./graph/python-resolver');
-          tree = await resolvePythonDependencyTreeFromManifest(manifest.data, { showPeerDeps, signal }, onProgress);
-          setSideData(prev => ({ ...prev, loadingLabel: 'Enriching with deps.dev metadata…' }));
-          await enrichPythonGraphWithDepsDevData(tree, signal);
-        } else if (manifest.type === 'go') {
-          const {resolveGoDependencyTreeFromManifest, enrichGoGraphWithDepsDevData} = await import('./graph/go-resolver');
-          tree = await resolveGoDependencyTreeFromManifest(manifest.data, { showPeerDeps, signal }, onProgress);
-          setSideData(prev => ({ ...prev, loadingLabel: 'Enriching with deps.dev metadata…' }));
-          await enrichGoGraphWithDepsDevData(tree, signal);
-        } else if (manifest.type === 'crates') {
-          const {resolveRustDependencyTreeFromManifest, enrichRustGraphWithDepsDevData} = await import('./graph/rust-resolver');
-          tree = await resolveRustDependencyTreeFromManifest(manifest.data, { showPeerDeps, signal }, onProgress);
-          setSideData(prev => ({ ...prev, loadingLabel: 'Enriching with deps.dev metadata…' }));
-          await enrichRustGraphWithDepsDevData(tree, signal);
-        } else if (manifest.type === 'nuget') {
-          const {resolveCSharpDependencyTreeFromManifest, enrichCSharpGraphWithDepsDevData} = await import('./graph/csharp-resolver');
-          tree = await resolveCSharpDependencyTreeFromManifest(manifest.data, { signal }, onProgress);
-          setSideData(prev => ({ ...prev, loadingLabel: 'Enriching with deps.dev metadata…' }));
-          await enrichCSharpGraphWithDepsDevData(tree, signal);
-        }
+        tree = await driver.resolveManifest(manifest, { showPeerDeps, signal }, onProgress);
       } else if (spec.name) {
         // Handle package specs
-        const version = spec.version;
-        if (registry === 'pypi') {
-          const {resolvePythonDependencyTree, enrichPythonGraphWithDepsDevData} = await import('./graph/python-resolver');
-          tree = await resolvePythonDependencyTree(spec.name, version || '*', { showPeerDeps, signal }, onProgress);
-          setSideData(prev => ({ ...prev, loadingLabel: 'Enriching with deps.dev metadata…' }));
-          await enrichPythonGraphWithDepsDevData(tree, signal);
-        } else if (registry === 'crates') {
-          const {resolveRustDependencyTree, enrichRustGraphWithDepsDevData} = await import('./graph/rust-resolver');
-          tree = await resolveRustDependencyTree(spec.name, version || '*', { showPeerDeps, signal }, onProgress);
-          setSideData(prev => ({ ...prev, loadingLabel: 'Enriching with deps.dev metadata…' }));
-          await enrichRustGraphWithDepsDevData(tree, signal);
-        } else if (registry === 'go') {
-          const {resolveGoDependencyTree, enrichGoGraphWithDepsDevData} = await import('./graph/go-resolver');
-          tree = await resolveGoDependencyTree(spec.name, version || 'latest', { showPeerDeps, signal }, onProgress);
-          setSideData(prev => ({ ...prev, loadingLabel: 'Enriching with deps.dev metadata…' }));
-          await enrichGoGraphWithDepsDevData(tree, signal);
-        } else if (registry === 'nuget') {
-          const {resolveCSharpDependencyTree, enrichCSharpGraphWithDepsDevData} = await import('./graph/csharp-resolver');
-          tree = await resolveCSharpDependencyTree(spec.name, version || '*', undefined, { signal }, onProgress);
-          setSideData(prev => ({ ...prev, loadingLabel: 'Enriching with deps.dev metadata…' }));
-          await enrichCSharpGraphWithDepsDevData(tree, signal);
-        } else {
-          // NPM
-          const {resolveDependencyTree, enrichGraphWithDepsDevData} = await import('./graph/resolver');
-          tree = await resolveDependencyTree(spec.name, version, { showPeerDeps, signal }, onProgress);
-          setSideData(prev => ({ ...prev, loadingLabel: 'Enriching with deps.dev metadata…' }));
-          await enrichGraphWithDepsDevData(tree, signal);
-        }
+        tree = await driver.resolveTree(spec.name, spec.version, { showPeerDeps, signal }, onProgress);
       } else {
         throw new Error('Invalid spec: no name or file content');
       }
 
+      setSideData(prev => ({ ...prev, loadingLabel: 'Enriching with deps.dev metadata…' }));
+      await enrichGraph(driver, tree, signal);
+
       setSideData(prev => ({ ...prev, loadingLabel: 'Computing layout…' }));
 
-      if (!tree) {
-        throw new Error(`Unsupported manifest or registry: ${registry}`);
-      }
       const layout = await layoutGraph(tree);
 
       setSideData({
@@ -245,17 +189,15 @@ function App() {
       newPackage: comparisonRightSpec.name || '',
       newVersion: comparisonRightSpec.version
     };
-    updateURL(
-      comparisonLeftSpec.source,
-      comparisonLeftSpec.name || '',
-      warningToggles,
-      undefined,
+    updateURL({
+      ecosystem: comparisonLeftSpec.source,
+      pkg: comparisonLeftSpec.name || '',
+      filters: warningToggles,
       showPeerDeps,
-      comparisonLeftSpec.version,
-      undefined,
-      compareState,
+      version: comparisonLeftSpec.version,
+      compare: compareState,
       micropackageThreshold
-    );
+    });
 
     // Generate both graphs in parallel
     await Promise.all([
@@ -314,17 +256,15 @@ function App() {
             newPackage: rightSpec.name || '',
             newVersion: rightSpec.version
           };
-          updateURL(
-            leftSpec.source,
-            leftSpec.name || '',
-            urlState.filters,
-            undefined,
-            urlState.showPeerDeps,
-            leftSpec.version,
-            undefined,
-            compareState,
-            urlState.micropackageThreshold
-          );
+          updateURL({
+            ecosystem: leftSpec.source,
+            pkg: leftSpec.name || '',
+            filters: urlState.filters,
+            showPeerDeps: urlState.showPeerDeps,
+            version: leftSpec.version,
+            compare: compareState,
+            micropackageThreshold: urlState.micropackageThreshold
+          });
 
           // Generate both graphs using local specs, not state
           setComparisonLeftData(prev => ({ ...prev, isLoading: true, loadingLabel: 'Resolving dependencies…' }));
@@ -388,17 +328,16 @@ function App() {
 
     if (lastSearchedInput && lastSearchedRegistry) {
       const viewport = viewportContext?.getViewport();
-      updateURL(
-        lastSearchedRegistry,
-        lastSearchedInput,
-        warningToggles,
-        viewport ? { x: viewport.x, y: viewport.y, zoom: viewport.zoom } : undefined,
+      updateURL({
+        ecosystem: lastSearchedRegistry,
+        pkg: lastSearchedInput,
+        filters: warningToggles,
+        viewport: viewport ? { x: viewport.x, y: viewport.y, zoom: viewport.zoom } : undefined,
         showPeerDeps,
-        lastSearchedVersion,
-        manifestUrl || undefined,
-        undefined,
+        version: lastSearchedVersion,
+        manifestUrl: manifestUrl || undefined,
         micropackageThreshold
-      );
+      });
     }
   }, [lastSearchedInput, lastSearchedRegistry, lastSearchedVersion, warningToggles, viewportContext, showPeerDeps, manifestUrl, isComparisonMode, micropackageThreshold]);
 
@@ -408,17 +347,16 @@ function App() {
 
     const interval = setInterval(() => {
       const viewport = viewportContext.getViewport();
-      const url = buildURL(
-        lastSearchedRegistry,
-        lastSearchedInput,
-        warningToggles,
-        { x: viewport.x, y: viewport.y, zoom: viewport.zoom },
+      const url = buildURL({
+        ecosystem: lastSearchedRegistry,
+        pkg: lastSearchedInput,
+        filters: warningToggles,
+        viewport: { x: viewport.x, y: viewport.y, zoom: viewport.zoom },
         showPeerDeps,
-        lastSearchedVersion,
-        manifestUrl || undefined,
-        undefined,
+        version: lastSearchedVersion,
+        manifestUrl: manifestUrl || undefined,
         micropackageThreshold
-      );
+      });
       // Skip the replaceState when the encoded state hasn't changed —
       // avoids a history write every 500ms while the viewport is idle
       if (window.location.hash !== url) {
@@ -435,6 +373,29 @@ function App() {
     return (resolved: number, total: number) => {
       setProgress({ resolved, total });
     };
+  };
+
+  // Shared tail of every graph-load path: surface resolution issues, run
+  // enrichment passes, compute the layout, and publish the graph.
+  const layoutResolvedTree = async (
+    driver: Awaited<ReturnType<typeof loadEcosystem>>,
+    tree: ResolvedGraph,
+    signal: AbortSignal
+  ) => {
+    if (tree.errors.length > 0) {
+      console.warn('Dependency resolution had errors:', tree.errors);
+    }
+    if (tree.cycles.length > 0) {
+      console.warn('Dependency cycles detected:', tree.cycles);
+      setWarningLine(`Detected ${tree.cycles.length} dependency cycle${tree.cycles.length === 1 ? '' : 's'}.`);
+    }
+    setLoadingLabel('Enriching with deps.dev metadata…');
+    await enrichGraph(driver, tree, signal);
+    setLoadingLabel('Computing layout…');
+    const layout = await layoutGraph(tree);
+    setGraphData(layout);
+    setSelectedNode(null);
+    setFitViewSignal(s => s + 1);
   };
 
   const generateGraph = async (identifier: string, registry: 'npm' | 'pypi' | 'crates' | 'go' | 'nuget' = 'npm', version?: string, overrideShowPeerDeps?: boolean) => {
@@ -457,87 +418,10 @@ function App() {
     try {
       const onProgress = makeProgressCallback(`Resolving ${identifier}`);
 
-      if (registry === 'pypi') {
-        // Use Python resolver
-        const { resolvePythonDependencyTree } = await import('./graph/python-resolver');
-        const usePeerDeps = overrideShowPeerDeps ?? showPeerDeps;
-        const tree = await resolvePythonDependencyTree(identifier, version || '*', { showPeerDeps: usePeerDeps, signal }, onProgress);
-        if (tree.errors.length > 0) {
-          console.warn('Dependency resolution had errors:', tree.errors);
-        }
-        setLoadingLabel('Enriching with deps.dev metadata…');
-        const { enrichPythonGraphWithDepsDevData } = await import('./graph/python-resolver');
-        await enrichPythonGraphWithDepsDevData(tree, signal);
-        setLoadingLabel('Computing layout…');
-        const layout = await layoutGraph(tree);
-        setGraphData(layout);
-        setFitViewSignal(s => s + 1);
-        setSelectedNode(null);
-      } else if (registry === 'crates') {
-        // Use Rust resolver
-        const {resolveRustDependencyTree, enrichRustGraphWithDepsDevData} = await import('./graph/rust-resolver');
-        const usePeerDeps = overrideShowPeerDeps ?? showPeerDeps;
-        const tree = await resolveRustDependencyTree(identifier, version || '*', { showPeerDeps: usePeerDeps, signal }, onProgress);
-        if (tree.errors.length > 0) {
-          console.warn('Dependency resolution had errors:', tree.errors);
-        }
-        setLoadingLabel('Enriching with deps.dev metadata…');
-        await enrichRustGraphWithDepsDevData(tree, signal);
-        setLoadingLabel('Computing layout…');
-        const layout = await layoutGraph(tree);
-        setGraphData(layout);
-        setFitViewSignal(s => s + 1);
-        setSelectedNode(null);
-      } else if (registry === 'go') {
-        // Use Go resolver
-        const {resolveGoDependencyTree, enrichGoGraphWithDepsDevData} = await import('./graph/go-resolver');
-        const usePeerDeps = overrideShowPeerDeps ?? showPeerDeps;
-        const tree = await resolveGoDependencyTree(identifier, version || 'latest', { showPeerDeps: usePeerDeps, signal }, onProgress);
-        // Filter out "no versions found" errors - these are expected for stdlib and private packages
-        const significantErrors = tree.errors.filter(e => !e.error.includes('no versions found'));
-        if (significantErrors.length > 0) {
-          console.warn('Dependency resolution had errors:', significantErrors);
-        }
-        setLoadingLabel('Enriching with deps.dev metadata…');
-        await enrichGoGraphWithDepsDevData(tree, signal);
-        setLoadingLabel('Computing layout…');
-        const layout = await layoutGraph(tree);
-        setGraphData(layout);
-        setFitViewSignal(s => s + 1);
-        setSelectedNode(null);
-      } else if (registry === 'nuget') {
-        // Use C# / NuGet resolver
-        const {resolveCSharpDependencyTree, enrichCSharpGraphWithDepsDevData} = await import('./graph/csharp-resolver');
-        const tree = await resolveCSharpDependencyTree(identifier, version || '*', undefined, { signal }, onProgress);
-        if (tree.errors.length > 0) {
-          console.warn('Dependency resolution had errors:', tree.errors);
-        }
-        setLoadingLabel('Enriching with deps.dev metadata…');
-        await enrichCSharpGraphWithDepsDevData(tree, signal);
-        setLoadingLabel('Computing layout…');
-        const layout = await layoutGraph(tree);
-        setGraphData(layout);
-        setFitViewSignal(s => s + 1);
-        setSelectedNode(null);
-      } else {
-        // Use NPM resolver
-        const usePeerDeps = overrideShowPeerDeps ?? showPeerDeps;
-        const tree = await resolveDependencyTree(identifier, version, { showPeerDeps: usePeerDeps, signal }, onProgress);
-        if (tree.errors.length > 0) {
-          console.warn('Dependency resolution had errors:', tree.errors);
-        }
-        if (tree.cycles.length > 0) {
-          console.warn('Dependency cycles detected:', tree.cycles);
-          setWarningLine(`Detected ${tree.cycles.length} dependency cycle${tree.cycles.length === 1 ? '' : 's'}.`);
-        }
-        setLoadingLabel('Enriching with deps.dev metadata…');
-        await enrichGraphWithDepsDevData(tree, signal);
-        setLoadingLabel('Computing layout…');
-        const layout = await layoutGraph(tree);
-        setGraphData(layout);
-        setFitViewSignal(s => s + 1);
-        setSelectedNode(null);
-      }
+      const usePeerDeps = overrideShowPeerDeps ?? showPeerDeps;
+      const driver = await loadEcosystem(registry);
+      const tree = await driver.resolveTree(identifier, version, { showPeerDeps: usePeerDeps, signal }, onProgress);
+      await layoutResolvedTree(driver, tree, signal);
     } catch (err: unknown) {
       if (isAbortError(err)) {
         return;
@@ -569,24 +453,8 @@ function App() {
       setIsComparisonMode(false);
       setComparisonLeftSpec(null);
       setComparisonRightSpec(null);
-      setComparisonLeftData({
-        title: '',
-        nodes: [],
-        edges: [],
-        isLoading: false,
-        progress: { resolved: 0, total: 0 },
-        loadingLabel: '',
-        error: null
-      });
-      setComparisonRightData({
-        title: '',
-        nodes: [],
-        edges: [],
-        isLoading: false,
-        progress: { resolved: 0, total: 0 },
-        loadingLabel: '',
-        error: null
-      });
+      setComparisonLeftData(emptyComparisonSide());
+      setComparisonRightData(emptyComparisonSide());
       // Clear the URL hash
       window.history.replaceState(null, '', '#');
     }
@@ -631,82 +499,17 @@ function App() {
 
       const onProgress = makeProgressCallback(`Resolving ${manifest.data.name}`);
 
-      if (manifest.type === 'npm') {
-        setLastSearchedRegistry('npm');
-        const identifier = buildPackageIdentifier(manifest.data.name, manifest.data.version);
-        setSearchInput(identifier);
-        setLastSearchedInput(manifest.data.name);
-        setLastSearchedVersion(manifest.data.version);
+      setLastSearchedRegistry(manifest.type);
+      setSearchInput(manifest.type === 'npm'
+        ? buildPackageIdentifier(manifest.data.name, manifest.data.version)
+        : manifest.data.name);
+      setLastSearchedInput(manifest.data.name);
+      // requirements.txt manifests carry a synthetic 'remote' version, not a real one
+      setLastSearchedVersion(manifest.type === 'pypi' ? undefined : manifest.data.version);
 
-        const { resolveDependencyTreeFromManifest } = await import('./graph/resolver');
-        const tree = await resolveDependencyTreeFromManifest({
-          name: manifest.data.name,
-          version: manifest.data.version || '0.0.0',
-          description: manifest.data.description || '',
-          dependencies: manifest.data.dependencies,
-          devDependencies: manifest.data.devDependencies,
-          peerDependencies: manifest.data.peerDependencies
-        }, { showPeerDeps, signal }, onProgress);
-
-        if (tree.errors.length > 0) {
-          console.warn('Dependency resolution had errors:', tree.errors);
-        }
-        if (tree.cycles.length > 0) {
-          setWarningLine(`Detected ${tree.cycles.length} dependency cycle${tree.cycles.length === 1 ? '' : 's'}.`);
-        }
-        setLoadingLabel('Enriching with deps.dev metadata…');
-        await enrichGraphWithDepsDevData(tree, signal);
-        setLoadingLabel('Computing layout…');
-        const layout = await layoutGraph(tree);
-        setGraphData(layout);
-        setSelectedNode(null);
-      } else if (manifest.type === 'pypi') {
-        setLastSearchedRegistry('pypi');
-        setSearchInput(manifest.data.name);
-        setLastSearchedInput(manifest.data.name);
-        setLastSearchedVersion(undefined);
-
-        const tree = await resolvePythonDependencyTreeFromManifest(manifest.data, { showPeerDeps, signal }, onProgress);
-        if (tree.errors.length > 0) {
-          console.warn('Dependency resolution had errors:', tree.errors);
-        }
-        setLoadingLabel('Computing layout…');
-        const layout = await layoutGraph(tree);
-        setGraphData(layout);
-        setSelectedNode(null);
-      } else if (manifest.type === 'crates') {
-        setLastSearchedRegistry('crates');
-        setSearchInput(manifest.data.name);
-        setLastSearchedInput(manifest.data.name);
-        setLastSearchedVersion(manifest.data.version);
-
-        const {resolveRustDependencyTreeFromManifest} = await import('./graph/rust-resolver');
-        const tree = await resolveRustDependencyTreeFromManifest(manifest.data, { showPeerDeps, signal }, onProgress);
-        if (tree.errors.length > 0) {
-          console.warn('Dependency resolution had errors:', tree.errors);
-        }
-        setLoadingLabel('Computing layout…');
-        const layout = await layoutGraph(tree);
-        setGraphData(layout);
-        setSelectedNode(null);
-      } else if (manifest.type === 'nuget') {
-        setLastSearchedRegistry('nuget');
-        setSearchInput(manifest.data.name);
-        setLastSearchedInput(manifest.data.name);
-        setLastSearchedVersion(manifest.data.version);
-
-        const {resolveCSharpDependencyTreeFromManifest} = await import('./graph/csharp-resolver');
-        const tree = await resolveCSharpDependencyTreeFromManifest(manifest.data, { signal }, onProgress);
-        if (tree.errors.length > 0) {
-          console.warn('Dependency resolution had errors:', tree.errors);
-        }
-        setLoadingLabel('Computing layout…');
-        const layout = await layoutGraph(tree);
-        setGraphData(layout);
-        setSelectedNode(null);
-      }
-
-      setFitViewSignal(s => s + 1);
+      const driver = await loadEcosystem(manifest.type);
+      const tree = await driver.resolveManifest(manifest, { showPeerDeps, signal }, onProgress);
+      await layoutResolvedTree(driver, tree, signal);
     } catch (err: unknown) {
       if (isAbortError(err)) {
         return;
@@ -723,17 +526,16 @@ function App() {
   const handleCopyView = async () => {
     if (!lastSearchedInput) return;
     const viewport = viewportContext?.getViewport();
-    const url = buildURL(
-      lastSearchedRegistry,
-      lastSearchedInput,
-      warningToggles,
-      viewport ? { x: viewport.x, y: viewport.y, zoom: viewport.zoom } : undefined,
+    const url = buildURL({
+      ecosystem: lastSearchedRegistry,
+      pkg: lastSearchedInput,
+      filters: warningToggles,
+      viewport: viewport ? { x: viewport.x, y: viewport.y, zoom: viewport.zoom } : undefined,
       showPeerDeps,
-      lastSearchedVersion,
-      manifestUrl || undefined,
-      undefined,
+      version: lastSearchedVersion,
+      manifestUrl: manifestUrl || undefined,
       micropackageThreshold
-    );
+    });
     const fullUrl = window.location.origin + url;
     try {
       await navigator.clipboard.writeText(fullUrl);
@@ -771,24 +573,8 @@ function App() {
         setIsComparisonMode(false);
         setComparisonLeftSpec(null);
         setComparisonRightSpec(null);
-        setComparisonLeftData({
-          title: '',
-          nodes: [],
-          edges: [],
-          isLoading: false,
-          progress: { resolved: 0, total: 0 },
-          loadingLabel: '',
-          error: null
-        });
-        setComparisonRightData({
-          title: '',
-          nodes: [],
-          edges: [],
-          isLoading: false,
-          progress: { resolved: 0, total: 0 },
-          loadingLabel: '',
-          error: null
-        });
+        setComparisonLeftData(emptyComparisonSide());
+        setComparisonRightData(emptyComparisonSide());
         // Clear the URL hash
         window.history.replaceState(null, '', '#');
       }
@@ -800,218 +586,31 @@ function App() {
       const signal = abortController.signal;
 
       const file = e.dataTransfer?.files?.[0];
-      if (file && file.name === 'package.json') {
+      const fileType = file ? detectManifestFileName(file.name) : null;
+      if (file && fileType) {
         try {
           const text = await file.text();
-          const pkg = JSON.parse(text);
-          if (!pkg.name) {
-            setErrorLine('package.json missing name field.');
-            setWarningLine(null);
-            return;
-          }
-          if (!pkg.dependencies && !pkg.devDependencies) {
-            setErrorLine('package.json has no dependencies to graph.');
-            setWarningLine(null);
-            return;
-          }
-          setLastSearchedRegistry('npm');
-          const identifier = buildPackageIdentifier(pkg.name, pkg.version);
-          setSearchInput(identifier);
-          setLastSearchedInput(pkg.name);
-          setLastSearchedVersion(pkg.version);
-          setIsLoading(true);
-          setErrorLine(null);
-          setWarningLine(null);
-          const onProgress = makeProgressCallback(`Resolving ${identifier}`);
-          try {
-            const { resolveDependencyTreeFromManifest } = await import('./graph/resolver');
-            const tree = await resolveDependencyTreeFromManifest(pkg, { showPeerDeps, signal }, onProgress);
-            if (tree.errors.length > 0) {
-              console.warn('Dependency resolution had errors:', tree.errors);
-            }
-            if (tree.cycles.length > 0) {
-              setWarningLine(`Detected ${tree.cycles.length} dependency cycle${tree.cycles.length === 1 ? '' : 's'}.`);
-            }
-            setLoadingLabel('Enriching with deps.dev metadata…');
-            await enrichGraphWithDepsDevData(tree, signal);
-            setLoadingLabel('Computing layout…');
-            const layout = await layoutGraph(tree);
-            setGraphData(layout);
-            setSelectedNode(null);
-            setFitViewSignal(s => s + 1);
-            // Clear URL so refresh doesn't reload
-            window.history.replaceState(null, '', '#');
-          } catch (err: unknown) {
-            if (!isAbortError(err)) {
-              const message = err instanceof Error ? err.message : 'Failed to generate graph.';
-              setErrorLine(message);
-            }
-          } finally {
-            if (abortControllerRef.current === abortController) {
-              setIsLoading(false);
-            }
-          }
-        } catch {
-          setErrorLine('Failed to parse package.json.');
-          setWarningLine(null);
-        }
-      } else if (file && (file.name === 'requirements.txt' || file.name.endsWith('.txt'))) {
-        try {
-          const text = await file.text();
-          const deps = parseRequirementsTxt(text);
-          if (deps.length === 0) {
-            setErrorLine('requirements.txt has no dependencies to graph.');
-            setWarningLine(null);
-            return;
+          const manifest = parseManifestContent(text, fileType, file.name);
+          if (!manifest) {
+            throw new Error(`Failed to parse ${file.name}`);
           }
 
-          // Convert to manifest format
-          const manifest = {
-            name: file.name.replace('.txt', ''),
-            version: 'local',
-            description: `Python requirements from ${file.name}`,
-            dependencies: Object.fromEntries(deps.filter(d => d.source === 'pypi').map(d => [d.name, d.specifier || '*']))
-          };
-
-          setLastSearchedRegistry('pypi');
-          setSearchInput(manifest.name);
-          setLastSearchedInput(manifest.name);
-          setLastSearchedVersion(undefined);
-          setIsLoading(true);
-          setErrorLine(null);
-          setWarningLine(null);
-
-          const onProgress = makeProgressCallback(`Resolving Python deps`);
-          try {
-            const tree = await resolvePythonDependencyTreeFromManifest(manifest, { showPeerDeps, signal }, onProgress);
-            if (tree.errors.length > 0) {
-              console.warn('Dependency resolution had errors:', tree.errors);
-            }
-            setLoadingLabel('Enriching with deps.dev metadata…');
-            const { enrichPythonGraphWithDepsDevData } = await import('./graph/python-resolver');
-            await enrichPythonGraphWithDepsDevData(tree, signal);
-            setLoadingLabel('Computing layout…');
-            const layout = await layoutGraph(tree);
-            setGraphData(layout);
-            setSelectedNode(null);
-            setFitViewSignal(s => s + 1);
-            // Clear URL so refresh doesn't reload
-            window.history.replaceState(null, '', '#');
-          } catch (err: unknown) {
-            if (!isAbortError(err)) {
-              const message = err instanceof Error ? err.message : 'Failed to generate graph.';
-              setErrorLine(message);
-            }
-          } finally {
-            if (abortControllerRef.current === abortController) {
-              setIsLoading(false);
-            }
-          }
-        } catch {
-          setErrorLine('Failed to parse requirements.txt.');
-          setWarningLine(null);
-        }
-      } else if (file && file.name === 'go.mod') {
-        try {
-          const text = await file.text();
-          const deps = parseGoMod(text);
-          const directDeps = deps.filter(d => !d.indirect);
-
-          if (directDeps.length === 0) {
-            setErrorLine('go.mod has no direct dependencies to graph.');
-            setWarningLine(null);
-            return;
-          }
-
-          // Extract module name from go.mod
-          const moduleMatch = text.match(/^module\s+(\S+)/m);
-          const moduleName = moduleMatch ? moduleMatch[1] : file.name.replace('.mod', '');
-
-          // Convert to manifest format
-          const manifest = {
-            name: moduleName,
-            version: 'local',
-            description: `Go module from ${file.name}`,
-            dependencies: Object.fromEntries(directDeps.map(d => [d.path, d.version]))
-          };
-
-          setLastSearchedRegistry('go');
-          setSearchInput(manifest.name);
-          setLastSearchedInput(manifest.name);
-          setLastSearchedVersion(undefined);
-          setIsLoading(true);
-          setErrorLine(null);
-          setWarningLine(null);
-
-          const onProgress = makeProgressCallback(`Resolving Go deps`);
-          try {
-            const { resolveGoDependencyTreeFromManifest, enrichGoGraphWithDepsDevData } = await import('./graph/go-resolver');
-            const tree = await resolveGoDependencyTreeFromManifest(manifest, { showPeerDeps, signal }, onProgress);
-            if (tree.errors.length > 0) {
-              console.warn('Dependency resolution had errors:', tree.errors);
-            }
-            setLoadingLabel('Enriching with deps.dev metadata…');
-            await enrichGoGraphWithDepsDevData(tree, signal);
-            setLoadingLabel('Computing layout…');
-            const layout = await layoutGraph(tree);
-            setGraphData(layout);
-            setSelectedNode(null);
-            setFitViewSignal(s => s + 1);
-            // Clear URL so refresh doesn't reload
-            window.history.replaceState(null, '', '#');
-          } catch (err: unknown) {
-            if (!isAbortError(err)) {
-              const message = err instanceof Error ? err.message : 'Failed to generate graph.';
-              setErrorLine(message);
-            }
-          } finally {
-            if (abortControllerRef.current === abortController) {
-              setIsLoading(false);
-            }
-          }
-        } catch {
-          setErrorLine('Failed to parse go.mod.');
-          setWarningLine(null);
-        }
-      } else if (file && (file.name === 'Cargo.toml' || file.name.endsWith('.csproj'))) {
-        try {
-          const text = await file.text();
-          const type = file.name.endsWith('.csproj') ? 'nuget' : 'crates';
-          const manifest = parseManifestContent(text, type, file.name);
-          if (!manifest || manifest.type !== type) {
-            throw new Error('Failed to parse manifest');
-          }
-
-          setLastSearchedRegistry(type);
-          setSearchInput(manifest.data.name);
+          setLastSearchedRegistry(fileType);
+          setSearchInput(fileType === 'npm'
+            ? buildPackageIdentifier(manifest.data.name, manifest.data.version)
+            : manifest.data.name);
           setLastSearchedInput(manifest.data.name);
-          setLastSearchedVersion(manifest.data.version);
+          // requirements.txt manifests carry a synthetic 'remote' version, not a real one
+          setLastSearchedVersion(fileType === 'pypi' ? undefined : manifest.data.version);
           setIsLoading(true);
           setErrorLine(null);
           setWarningLine(null);
 
           const onProgress = makeProgressCallback(`Resolving ${manifest.data.name}`);
           try {
-            let tree;
-            if (manifest.type === 'crates') {
-              const { resolveRustDependencyTreeFromManifest, enrichRustGraphWithDepsDevData } = await import('./graph/rust-resolver');
-              tree = await resolveRustDependencyTreeFromManifest(manifest.data, { showPeerDeps, signal }, onProgress);
-              setLoadingLabel('Enriching with deps.dev metadata…');
-              await enrichRustGraphWithDepsDevData(tree, signal);
-            } else {
-              const { resolveCSharpDependencyTreeFromManifest, enrichCSharpGraphWithDepsDevData } = await import('./graph/csharp-resolver');
-              tree = await resolveCSharpDependencyTreeFromManifest(manifest.data, { signal }, onProgress);
-              setLoadingLabel('Enriching with deps.dev metadata…');
-              await enrichCSharpGraphWithDepsDevData(tree, signal);
-            }
-            if (tree.errors.length > 0) {
-              console.warn('Dependency resolution had errors:', tree.errors);
-            }
-            setLoadingLabel('Computing layout…');
-            const layout = await layoutGraph(tree);
-            setGraphData(layout);
-            setSelectedNode(null);
-            setFitViewSignal(s => s + 1);
+            const driver = await loadEcosystem(fileType);
+            const tree = await driver.resolveManifest(manifest, { showPeerDeps, signal }, onProgress);
+            await layoutResolvedTree(driver, tree, signal);
             // Clear URL so refresh doesn't reload
             window.history.replaceState(null, '', '#');
           } catch (err: unknown) {
@@ -1024,8 +623,9 @@ function App() {
               setIsLoading(false);
             }
           }
-        } catch {
-          setErrorLine(`Failed to parse ${file.name}.`);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : `Failed to parse ${file.name}.`;
+          setErrorLine(message);
           setWarningLine(null);
         }
       } else if (file) {
@@ -1050,180 +650,17 @@ function App() {
   // Make sure we pass the full node data to Sidebar
   const selectedNodeData = graphData.nodes.find(n => n.id === selectedNode)?.data || null;
 
-  const highlightedGraphData = useMemo(() => {
-    // Compute search matches
-    const searchLower = graphSearchQuery.trim().toLowerCase();
-    const searchMatches = new Set<string>();
-    if (searchLower) {
-      for (const node of graphData.nodes) {
-        if (node.data.pkgName.toLowerCase().includes(searchLower)) {
-          searchMatches.add(node.id);
-        }
-      }
-    }
-
-    // Add warningToggles and searchMatch to all nodes first
-    const nodesWithWarnings = graphData.nodes.map((node) => ({
-      ...node,
-      data: {
-        ...node.data,
-        warningToggles,
-        micropackageThreshold,
-        searchMatch: searchMatches.has(node.id) }
-    }));
-
-    if (!selectedNode) {
-      return {
-        ...graphData,
-        nodes: nodesWithWarnings };
-    }
-
-    const outgoing = new Map<string, string[]>();
-    const incoming = new Map<string, string[]>();
-
-    for (const edge of graphData.edges) {
-      if (!outgoing.has(edge.source)) outgoing.set(edge.source, []);
-      if (!incoming.has(edge.target)) incoming.set(edge.target, []);
-      outgoing.get(edge.source)!.push(edge.target);
-      incoming.get(edge.target)!.push(edge.source);
-    }
-
-    const downstreamNodes = new Set<string>();
-    const upstreamNodes = new Set<string>();
-    const downstreamEdges = new Set<string>();
-    const upstreamEdges = new Set<string>();
-
-    const walk = (
-      startId: string,
-      neighbors: Map<string, string[]>,
-      targetNodes: Set<string>,
-      targetEdges: Set<string>
-    ) => {
-      const queue = [startId];
-      const visited = new Set<string>([startId]);
-
-      for (let i = 0; i < queue.length; i++) {
-        const current = queue[i];
-        for (const next of neighbors.get(current) || []) {
-          targetEdges.add(`${current}->${next}`);
-          if (visited.has(next)) continue;
-          visited.add(next);
-          targetNodes.add(next);
-          queue.push(next);
-        }
-      }
-    };
-
-    walk(selectedNode, outgoing, downstreamNodes, downstreamEdges);
-    walk(selectedNode, incoming, upstreamNodes, upstreamEdges);
-
-    // Nodes reachable from any root WITHOUT passing through the selected node.
-    // Computed once — a purely-downstream node is "dedicated" iff it isn't in
-    // this set (previously this BFS ran once per downstream node).
-    const reachableFromRoot = new Set<string>();
-    const rootQueue: string[] = [];
-    for (const n of nodesWithWarnings) {
-      if (n.data.isRoot && n.id !== selectedNode) {
-        rootQueue.push(n.id);
-        reachableFromRoot.add(n.id);
-      }
-    }
-    for (let i = 0; i < rootQueue.length; i++) {
-      const current = rootQueue[i];
-      for (const next of outgoing.get(current) || []) {
-        if (next === selectedNode) continue; // blocked by selected node
-        if (!reachableFromRoot.has(next)) {
-          reachableFromRoot.add(next);
-          rootQueue.push(next);
-        }
-      }
-    }
-
-    const highlightedNodes = nodesWithWarnings.map((node) => {
-      let relationship: 'selected' | 'upstream' | 'downstream' | 'dedicated' | 'both' | 'dimmed' = 'dimmed';
-      if (node.id === selectedNode) {
-        relationship = 'selected';
-      } else if (upstreamNodes.has(node.id) && downstreamNodes.has(node.id)) {
-        relationship = 'both';
-      } else if (upstreamNodes.has(node.id)) {
-        relationship = 'upstream';
-      } else if (downstreamNodes.has(node.id)) {
-        relationship = reachableFromRoot.has(node.id) ? 'downstream' : 'dedicated';
-      }
-
-      const isDimmed = relationship === 'dimmed';
-
-      return {
-        ...node,
-        data: {
-          ...node.data,
-          relationship },
-        style: {
-          ...(node.style || {}),
-          opacity: isDimmed ? 0.4 : 1,
-          transition: 'opacity 180ms ease' }
-      };
-    });
-
-    const relationshipByNode = new Map(highlightedNodes.map(n => [n.id, n.data.relationship]));
-
-    const highlightedEdges = graphData.edges.map((edge) => {
-      const forwardKey = `${edge.source}->${edge.target}`;
-      const reverseKey = `${edge.target}->${edge.source}`;
-      const isDownstream = downstreamEdges.has(forwardKey);
-      const isUpstream = upstreamEdges.has(reverseKey);
-
-      let relationship: 'upstream' | 'downstream' | 'dedicated' | 'both' | 'dimmed' = 'dimmed';
-      if (isUpstream && isDownstream) {
-        relationship = 'both';
-      } else if (isUpstream) {
-        relationship = 'upstream';
-      } else if (isDownstream) {
-        // Find if target node is dedicated
-        relationship = relationshipByNode.get(edge.target) === 'dedicated' ? 'dedicated' : 'downstream';
-      }
-
-      let stroke = edge.type === 'peer' || edge.type === 'extra' ? '#c084fc' : 'var(--text-muted)';
-      let opacity = edge.type === 'peer' || edge.type === 'extra' ? 0.6 : 0.14;
-      let strokeWidth = edge.type === 'peer' || edge.type === 'extra' ? 3 : 2;
-      let strokeDasharray = edge.type === 'peer' || edge.type === 'extra' ? '6 6' : undefined;
-
-      if (relationship === 'upstream') {
-        stroke = 'var(--accent-emerald)';
-        opacity = 0.95;
-        strokeWidth = 3;
-      } else if (relationship === 'downstream') {
-        stroke = 'var(--accent-blue)';
-        opacity = 0.95;
-        strokeWidth = 3;
-      } else if (relationship === 'dedicated') {
-        stroke = 'var(--accent-blue)';
-        opacity = 1;
-        strokeWidth = 2;
-        // Ensure dedicated peers/extras keep dash style
-        strokeDasharray = edge.type === 'peer' || edge.type === 'extra' ? '6 6' : undefined;
-      } else if (relationship === 'both') {
-        stroke = 'var(--accent-amber)';
-        opacity = 1;
-        strokeWidth = 3;
-      }
-
-      return {
-        ...edge,
-        style: {
-          ...(edge.style || {}),
-          stroke,
-          opacity,
-          strokeWidth,
-          strokeDasharray,
-          transition: 'opacity 180ms ease, stroke 180ms ease' }
-      };
-    });
-
-    return {
-      nodes: highlightedNodes,
-      edges: highlightedEdges };
-  }, [graphData, selectedNode, warningToggles, graphSearchQuery, micropackageThreshold]);
+  const highlightedGraphData = useMemo(
+    () => computeHighlightedGraph({
+      nodes: graphData.nodes,
+      edges: graphData.edges,
+      selectedNode,
+      warningToggles,
+      graphSearchQuery,
+      micropackageThreshold
+    }),
+    [graphData, selectedNode, warningToggles, graphSearchQuery, micropackageThreshold]
+  );
 
   return (
     <div className="app-container">
@@ -1435,8 +872,8 @@ function App() {
             fetchGraphForVersion={async (version) => {
               const cached = timelineGraphCacheRef.current.get(version);
               if (cached) return cached;
-              const { resolveDependencyTree } = await import('./graph/resolver');
-              const graph = await resolveDependencyTree(lastSearchedInput, version, { showPeerDeps });
+              const driver = await loadEcosystem('npm');
+              const graph = await driver.resolveTree(lastSearchedInput, version, { showPeerDeps });
               timelineGraphCacheRef.current.set(version, graph);
               return graph;
             }}
@@ -1473,24 +910,8 @@ function App() {
                 />
                 <button
                   onClick={() => {
-                    setComparisonLeftData({
-                      title: '',
-                      nodes: [],
-                      edges: [],
-                      isLoading: false,
-                      progress: { resolved: 0, total: 0 },
-                      loadingLabel: '',
-                      error: null
-                    });
-                    setComparisonRightData({
-                      title: '',
-                      nodes: [],
-                      edges: [],
-                      isLoading: false,
-                      progress: { resolved: 0, total: 0 },
-                      loadingLabel: '',
-                      error: null
-                    });
+                    setComparisonLeftData(emptyComparisonSide());
+                    setComparisonRightData(emptyComparisonSide());
                     setComparisonLeftSpec(null);
                     setComparisonRightSpec(null);
                     // Clear the URL hash

@@ -1,8 +1,7 @@
 import { fetchPackageMeta, fetchVersionDependencies, getBestDependencyGroup, resolveNuGetVersion } from '../api/nuget';
-import type { DependencySource, ProgressCallback, ResolvedGraph, ResolverOptions } from './resolver';
-import { makeEdgeAdder } from './resolver';
+import type { BfsQueueItem, ProgressCallback, ResolvedGraph, ResolverOptions } from './resolver';
+import { runBfs } from './resolver';
 import { enrichBulkWithDepsDevData } from '../utils/depsdev-enrichment';
-import { AbortedError } from '../utils/retry';
 
 export interface CsprojManifest {
     name: string;
@@ -12,142 +11,90 @@ export interface CsprojManifest {
     dependencies: Record<string, string>;
 }
 
+const MAX_DEPTH = 100;
+
 async function runBfsCSharpResolution(
     graph: ResolvedGraph,
-    queue: Array<{ name: string; versionDef: string; parentId: string | null; isPeer?: boolean; depth?: number }>,
+    queue: BfsQueueItem[],
     targetFramework?: string,
     options: ResolverOptions = {},
     onProgress?: ProgressCallback
 ): Promise<void> {
     const inProgress = new Set<string>();
     const resolvedPackages = new Set<string>();
-    const addEdge = makeEdgeAdder(graph);
-    let resolved = 0;
-    let total = queue.length;
-    const MAX_DEPTH = 100;
 
-    const detectCSharpSource = (): DependencySource => {
-        return 'nuget';
-    };
-
-    const processQueue = async () => {
-        if (options.signal?.aborted) throw new AbortedError();
-        const CONCURRENCY = 10;
-        const batch = queue.splice(0, CONCURRENCY);
-
-        await Promise.all(batch.map(async ({ name, versionDef, parentId, isPeer, depth = 0 }) => {
-            if (options.signal?.aborted) throw new AbortedError();
+    await runBfs(graph, queue, options, onProgress, {
+        ghostSource: () => 'nuget',
+        process: async ({ name, versionDef, parentId, isPeer, depth = 0 }, ctx) => {
             if (depth >= MAX_DEPTH) {
-                resolved++;
-                onProgress?.(resolved, total);
                 return;
             }
 
-            let resolvedVersion = versionDef;
-
-            try {
-                if (resolvedPackages.has(name.toLowerCase())) {
-                    resolved++;
-                    onProgress?.(resolved, total);
-                    return;
-                }
-
-                const meta = await fetchPackageMeta(name, options.signal);
-                resolvedPackages.add(name.toLowerCase());
-
-                const versions = meta.versions.map(v => v.version);
-                if (versions.length === 0) {
-                    throw new Error(`No versions found for package ${name}`);
-                }
-
-                resolvedVersion = resolveNuGetVersion(versionDef, versions);
-
-                const nodeId = `${name}@${resolvedVersion}`;
-
-                if (parentId) {
-                    addEdge(parentId, nodeId, isPeer ? 'peer' : 'dependency');
-                }
-
-                if (graph.nodes.has(nodeId) || inProgress.has(nodeId)) {
-                    resolved++;
-                    onProgress?.(resolved, total);
-                    return;
-                }
-
-                inProgress.add(nodeId);
-
-                const versionData = meta.versions.find(v => v.version === resolvedVersion);
-                const uploadTime = versionData?.published || '';
-
-                // Fetch dependencies for this specific version (not included in search API)
-                const dependencyGroups = await fetchVersionDependencies(name, resolvedVersion, options.signal);
-                const bestGroup = getBestDependencyGroup(dependencyGroups, targetFramework);
-                const dependencies: Record<string, string> = {};
-
-                if (bestGroup) {
-                    for (const dep of bestGroup.dependencies) {
-                        dependencies[dep.id] = dep.range;
-                    }
-                }
-
-                graph.nodes.set(nodeId, {
-                    id: nodeId,
-                    pkgName: name,
-                    version: resolvedVersion,
-                    description: meta.description || '',
-                    maintainers: (() => {
-                        if (!meta.authors) return 0;
-                        if (typeof meta.authors === 'string') return meta.authors.split(',').length;
-                        if (Array.isArray(meta.authors)) return meta.authors.length;
-                        return 1;
-                    })(),
-                    lastPublish: uploadTime || new Date().toISOString(),
-                    dependencies: dependencies,
-                    isRoot: parentId === null,
-                    isPeer: isPeer || false,
-                    readme: meta.description,
-                    source: detectCSharpSource() });
-
-                // Add dependencies
-                const newDeps = Object.entries(dependencies);
-                total += newDeps.length;
-                for (const [depName, depVersion] of newDeps) {
-                    queue.push({ name: depName, versionDef: depVersion, parentId: nodeId, depth: depth + 1 });
-                }
-            } catch (err: unknown) {
-                if (err instanceof AbortedError || options.signal?.aborted) throw new AbortedError();
-                const message = err instanceof Error ? err.message : 'Unknown dependency resolution error';
-                graph.errors.push({ pkg: name, error: message });
-
-                if (parentId === null) {
-                    throw err;
-                }
-
-                const ghostId = `${name}@${versionDef}`;
-                if (!graph.nodes.has(ghostId)) {
-                    graph.nodes.set(ghostId, {
-                        id: ghostId,
-                        pkgName: name,
-                        version: versionDef,
-                        description: 'Package could not be resolved',
-                        maintainers: 0,
-                        lastPublish: new Date().toISOString(),
-                        dependencies: {},
-                        isNotFound: true,
-                        source: detectCSharpSource()
-                    });
-                }
-                addEdge(parentId, ghostId, 'dependency');
+            if (resolvedPackages.has(name.toLowerCase())) {
+                return;
             }
 
-            resolved++;
-            onProgress?.(resolved, total);
-        }));
-    };
+            const meta = await fetchPackageMeta(name, options.signal);
+            resolvedPackages.add(name.toLowerCase());
 
-    while (queue.length > 0) {
-        await processQueue();
-    }
+            const versions = meta.versions.map(v => v.version);
+            if (versions.length === 0) {
+                throw new Error(`No versions found for package ${name}`);
+            }
+
+            const resolvedVersion = resolveNuGetVersion(versionDef, versions);
+
+            const nodeId = `${name}@${resolvedVersion}`;
+
+            if (parentId) {
+                ctx.addEdge(parentId, nodeId, isPeer ? 'peer' : 'dependency');
+            }
+
+            if (graph.nodes.has(nodeId) || inProgress.has(nodeId)) {
+                return;
+            }
+
+            inProgress.add(nodeId);
+
+            const versionData = meta.versions.find(v => v.version === resolvedVersion);
+            const uploadTime = versionData?.published || '';
+
+            // Fetch dependencies for this specific version (not included in search API)
+            const dependencyGroups = await fetchVersionDependencies(name, resolvedVersion, options.signal);
+            const bestGroup = getBestDependencyGroup(dependencyGroups, targetFramework);
+            const dependencies: Record<string, string> = {};
+
+            if (bestGroup) {
+                for (const dep of bestGroup.dependencies) {
+                    dependencies[dep.id] = dep.range;
+                }
+            }
+
+            graph.nodes.set(nodeId, {
+                id: nodeId,
+                pkgName: name,
+                version: resolvedVersion,
+                description: meta.description || '',
+                maintainers: (() => {
+                    if (!meta.authors) return 0;
+                    if (typeof meta.authors === 'string') return meta.authors.split(',').length;
+                    if (Array.isArray(meta.authors)) return meta.authors.length;
+                    return 1;
+                })(),
+                lastPublish: uploadTime || new Date().toISOString(),
+                dependencies: dependencies,
+                isRoot: parentId === null,
+                isPeer: isPeer || false,
+                readme: meta.description,
+                source: 'nuget' });
+
+            // Add dependencies
+            const newDeps = Object.entries(dependencies);
+            for (const [depName, depVersion] of newDeps) {
+                ctx.enqueue({ name: depName, versionDef: depVersion, parentId: nodeId, depth: depth + 1 });
+            }
+        }
+    });
 }
 
 export async function resolveCSharpDependencyTree(

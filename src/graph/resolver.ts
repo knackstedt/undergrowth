@@ -48,6 +48,16 @@ export interface GraphNodeData {
     externalLinks?: Array<{ label: string; url: string; }>;
     /** True if this package is a micropackage (small footprint, narrow scope) */
     isMicropackage?: boolean;
+    /** Source repository URL reported by the registry (e.g. github.com/...) */
+    repoUrl?: string;
+    /** Minified + gzip sizes from bundlephobia (npm packages only) */
+    bundleSize?: { size: number; gzip: number; };
+    /** Repository stats fetched via ungh (GitHub repos only) */
+    repoStats?: { stars: number; forks: number; pushedAt?: string; };
+    /** OS package-manager repos that ship this project (from repology) */
+    distroRepos?: string[];
+    /** Metrics from libraries.io (only when an API key is configured) */
+    librariesIo?: { dependents?: number; stars?: number; rank?: number; };
 }
 
 /** Size threshold for micropackages in bytes (6KB default) */
@@ -191,223 +201,284 @@ export interface ResolverOptions {
     signal?: AbortSignal;
 }
 
+export type GraphEdgeType = 'dependency' | 'peer' | 'dev' | 'extra';
+
+/**
+ * Shared queue-item shape for the ecosystem BFS resolvers.
+ */
+export interface BfsQueueItem {
+    name: string;
+    versionDef: string;
+    parentId: string | null;
+    depth?: number;
+    isOptional?: boolean;
+    isPeer?: boolean;
+    isDev?: boolean;
+}
+
+export interface BfsContext<T extends BfsQueueItem = BfsQueueItem> {
+    graph: ResolvedGraph;
+    signal?: AbortSignal;
+    addEdge: (source: string, target: string, type: GraphEdgeType) => void;
+    /** Push a new item onto the queue and bump the progress total. */
+    enqueue: (item: T) => void;
+}
+
+export interface BfsHooks<T extends BfsQueueItem> {
+    /** Process one queue item. Throw to record a resolution failure —
+     * abort signals and root-item failures propagate, everything else
+     * produces a "not found" ghost node. */
+    process: (item: T, ctx: BfsContext<T>) => Promise<void>;
+    /** Source tag for the ghost node created on failure. */
+    ghostSource?: (item: T) => DependencySource;
+    /** Edge type for the ghost node created on failure. */
+    ghostEdgeType?: (item: T) => GraphEdgeType;
+}
+
+/**
+ * Generic batched-BFS driver shared by all ecosystem resolvers: bounded
+ * concurrency, abort checks, progress counting, edge deduplication, and
+ * ghost-node failure handling. Ecosystem-specific logic (metadata fetch,
+ * version resolution, node building, dependency expansion) lives in
+ * `hooks.process`.
+ */
+export async function runBfs<T extends BfsQueueItem>(
+    graph: ResolvedGraph,
+    queue: T[],
+    options: ResolverOptions,
+    onProgress: ProgressCallback | undefined,
+    hooks: BfsHooks<T>
+): Promise<void> {
+    const addEdge = makeEdgeAdder(graph);
+    let resolved = 0;
+    let total = queue.length;
+    const CONCURRENCY = 10;
+
+    const ctx: BfsContext<T> = {
+        graph,
+        signal: options.signal,
+        addEdge,
+        enqueue: (item) => {
+            total++;
+            queue.push(item);
+        }
+    };
+
+    const handleFailure = (item: T, err: unknown): void => {
+        if (err instanceof AbortedError || options.signal?.aborted) throw new AbortedError();
+        const message = err instanceof Error ? err.message : 'Unknown dependency resolution error';
+        graph.errors.push({ pkg: item.name, error: message });
+
+        // Root package failure — re-throw so the caller can show a dialog
+        if (item.parentId === null) throw err;
+
+        // Dependency (not root): add a ghost "not found" node so the graph
+        // still shows that something was expected here.
+        const ghostId = `${item.name}@${item.versionDef}`;
+        if (!graph.nodes.has(ghostId)) {
+            graph.nodes.set(ghostId, {
+                id: ghostId,
+                pkgName: item.name,
+                version: item.versionDef,
+                description: 'Package could not be resolved',
+                maintainers: 0,
+                lastPublish: new Date().toISOString(),
+                dependencies: {},
+                isNotFound: true,
+                source: hooks.ghostSource?.(item) ?? 'other'
+            });
+        }
+        addEdge(item.parentId, ghostId, hooks.ghostEdgeType?.(item) ?? 'dependency');
+    };
+
+    while (queue.length > 0) {
+        if (options.signal?.aborted) throw new AbortedError();
+        const batch = queue.splice(0, CONCURRENCY);
+
+        await Promise.all(batch.map(async (item) => {
+            if (options.signal?.aborted) throw new AbortedError();
+            try {
+                await hooks.process(item, ctx);
+            } catch (err: unknown) {
+                handleFailure(item, err);
+            }
+            resolved++;
+            onProgress?.(resolved, total);
+        }));
+    }
+}
+
 async function runBfsResolution(
     graph: ResolvedGraph,
-    queue: Array<{ name: string; versionDef: string; parentId: string | null; isPeer?: boolean; isDev?: boolean; }>,
+    queue: BfsQueueItem[],
     options: ResolverOptions = {},
     onProgress?: ProgressCallback
 ): Promise<void> {
     const inProgress = new Set<string>();
-    const addEdge = makeEdgeAdder(graph);
-    let resolved = 0;
-    let total = queue.length;
 
-    const processQueue = async () => {
-        if (options.signal?.aborted) throw new AbortedError();
-        const CONCURRENCY = 10;
-        const batch = queue.splice(0, CONCURRENCY);
-
-        await Promise.all(batch.map(async ({ name, versionDef, parentId, isPeer, isDev }) => {
-            if (options.signal?.aborted) throw new AbortedError();
+    await runBfs(graph, queue, options, onProgress, {
+        ghostSource: (item) => detectSource(item.name, item.versionDef),
+        process: async ({ name, versionDef, parentId, isPeer, isDev }, ctx) => {
             let resolvedVersion = versionDef;
 
-            try {
-                const meta = await fetchPackageMeta(name, options.signal);
+            const meta = await fetchPackageMeta(name, options.signal);
 
-                const versions = Object.keys(meta.versions);
-                if (versionDef === 'latest') {
-                    resolvedVersion = meta['dist-tags'].latest || versions[versions.length - 1];
-                } else {
-                    resolvedVersion = resolveVersion(versionDef, versions);
-                }
-
-                const nodeId = `${name}@${resolvedVersion}`;
-
-                if (parentId) {
-                    const edgeType = isPeer ? 'peer' : isDev ? 'dev' : 'dependency';
-                    addEdge(parentId, nodeId, edgeType);
-                }
-
-                if (graph.nodes.has(nodeId) || inProgress.has(nodeId)) {
-                    resolved++;
-                    onProgress?.(resolved, total);
-                    return;
-                }
-
-                inProgress.add(nodeId);
-
-                const pkgData = meta.versions[resolvedVersion];
-                if (!pkgData) {
-                    throw new Error(`Version ${resolvedVersion} not found for ${name}`);
-                }
-
-                const dependencies = pkgData.dependencies || {};
-
-                // Detect module type from exports, type field, or main/module
-                let moduleType: 'cjs' | 'esm' | 'both' | undefined;
-                const hasEsm = pkgData.module || pkgData.exports?.import || (pkgData.type === 'module');
-                const hasCjs = pkgData.main || pkgData.exports?.require || (!pkgData.type || pkgData.type === 'commonjs');
-                if (hasEsm && hasCjs) moduleType = 'both';
-                else if (hasEsm) moduleType = 'esm';
-                else if (hasCjs) moduleType = 'cjs';
-
-                // Check if parent is root to identify direct dependencies
-                const isRoot = parentId === null;
-                const isDirectDep = parentId ? (graph.nodes.get(parentId)?.isRoot ?? false) : false;
-
-                // Build lists of newer versions for tooltip and detail panel first
-                const allVersions = Object.keys(meta.versions);
-                const newer = allVersions.filter(v => semver.valid(v) && semver.gt(v, resolvedVersion));
-                const newerStable = newer.filter(v => !isPrerelease(v)).sort(semver.compare);
-                const newerPrerelease = newer.filter(v => isPrerelease(v));
-
-                // Check if package is outdated (only if semver-higher releases actually exist)
-                const latestVersion = meta['dist-tags']?.latest;
-                let isOutdated = false;
-                let isPrereleaseAvailable = false;
-                let newerVersions: string[] = [];
-                let prereleaseVersions: string[] = [];
-                if (latestVersion && resolvedVersion !== latestVersion && newer.length > 0) {
-                    if (isPrerelease(latestVersion) && !isPrerelease(resolvedVersion)) {
-                        isPrereleaseAvailable = true;
-                    } else {
-                        isOutdated = true;
-                    }
-                }
-
-                // Condense versions: show latest of each newer major,
-                // plus latest minor for current major, plus latest patch for current minor
-                const parsed = semver.parse(resolvedVersion);
-                const preByMajor = new Map<number, string>();
-                let preLatestMinor: string | undefined;
-                let preLatestPatch: string | undefined;
-                for (const v of newerPrerelease) {
-                    const p = semver.parse(v);
-                    if (!p) continue;
-                    if (p.major > (parsed?.major ?? 0)) {
-                        const existing = preByMajor.get(p.major);
-                        if (!existing || semver.gt(v, existing)) {
-                            preByMajor.set(p.major, v);
-                        }
-                    } else if (p.major === (parsed?.major ?? 0) && p.minor > (parsed?.minor ?? 0)) {
-                        if (!preLatestMinor || semver.gt(v, preLatestMinor)) {
-                            preLatestMinor = v;
-                        }
-                    } else if (p.major === (parsed?.major ?? 0) && p.minor === (parsed?.minor ?? 0) && p.patch > (parsed?.patch ?? 0)) {
-                        if (!preLatestPatch || semver.gt(v, preLatestPatch)) {
-                            preLatestPatch = v;
-                        }
-                    }
-                }
-                prereleaseVersions = [...preByMajor.values(), ...(preLatestMinor ? [preLatestMinor] : []), ...(preLatestPatch ? [preLatestPatch] : [])].sort(semver.compare);
-
-                const byMajor = new Map<number, string>();
-                let latestMinor: string | undefined;
-                let latestPatch: string | undefined;
-                for (const v of newerStable) {
-                    const p = semver.parse(v);
-                    if (!p) continue;
-                    if (p.major > (parsed?.major ?? 0)) {
-                        const existing = byMajor.get(p.major);
-                        if (!existing || semver.gt(v, existing)) {
-                            byMajor.set(p.major, v);
-                        }
-                    } else if (p.major === (parsed?.major ?? 0) && p.minor > (parsed?.minor ?? 0)) {
-                        if (!latestMinor || semver.gt(v, latestMinor)) {
-                            latestMinor = v;
-                        }
-                    } else if (p.major === (parsed?.major ?? 0) && p.minor === (parsed?.minor ?? 0) && p.patch > (parsed?.patch ?? 0)) {
-                        if (!latestPatch || semver.gt(v, latestPatch)) {
-                            latestPatch = v;
-                        }
-                    }
-                }
-                newerVersions = [...byMajor.values(), ...(latestMinor ? [latestMinor] : []), ...(latestPatch ? [latestPatch] : [])].sort(semver.compare);
-
-                // pkgData.license is already normalized to string by npm.ts fetchPackageMeta
-                const licenseStr = pkgData.license;
-
-                const size = pkgData.dist?.unpackedSize;
-                const fileCount = pkgData.dist?.fileCount;
-                const hasSizeData = size !== undefined && size > 0;
-                const isMicropackage = hasSizeData
-                    ? size < MICROPACKAGE_SIZE_THRESHOLD
-                    : (fileCount !== undefined && fileCount > 0 && fileCount <= 3);
-
-                graph.nodes.set(nodeId, {
-                    id: nodeId,
-                    pkgName: name,
-                    version: resolvedVersion,
-                    description: pkgData.description || meta.description,
-                    maintainers: meta.maintainers?.length || pkgData.maintainers?.length || 0,
-                    lastPublish: meta.time?.[resolvedVersion] || meta.time?.modified || new Date().toISOString(),
-                    dependencies: dependencies,
-                    isRoot,
-                    isPeer: isPeer || false,
-                    readme: meta.readme,
-                    source: detectSource(name, versionDef),
-                    moduleType,
-                    size,
-                    license: licenseStr,
-                    isDirectDep,
-                    isOutdated: !!isOutdated,
-                    isPrereleaseAvailable: !!isPrereleaseAvailable,
-                    latestVersion: newerVersions.length > 0 ? newerVersions[newerVersions.length - 1] : undefined,
-                    newerVersions: newerVersions.length > 0 ? newerVersions : undefined,
-                    prereleaseVersions: prereleaseVersions.length > 0 ? prereleaseVersions : undefined,
-                    isMicropackage
-                });
-
-                const newDeps = Object.entries(dependencies);
-                total += newDeps.length;
-                for (const [depName, depVersion] of newDeps) {
-                    queue.push({ name: depName, versionDef: depVersion, parentId: nodeId });
-                }
-
-                if (options.showPeerDeps) {
-                    const peerDeps = Object.entries(pkgData.peerDependencies || {});
-                    total += peerDeps.length;
-                    for (const [peerName, peerVersion] of peerDeps) {
-                        queue.push({ name: peerName, versionDef: peerVersion, parentId: nodeId, isPeer: true });
-                    }
-                }
-            } catch (err: unknown) {
-                if (err instanceof AbortedError || options.signal?.aborted) throw new AbortedError();
-                const message = err instanceof Error ? err.message : 'Unknown dependency resolution error';
-                graph.errors.push({ pkg: name, error: message });
-
-                // Root package failure — re-throw so the caller can show a dialog
-                if (parentId === null) {
-                    throw err;
-                }
-
-                // If this is a dependency (not the root), add a ghost "not found" node
-                // so the graph still shows that something was expected here.
-                const ghostId = `${name}@${versionDef}`;
-                if (!graph.nodes.has(ghostId)) {
-                    graph.nodes.set(ghostId, {
-                        id: ghostId,
-                        pkgName: name,
-                        version: versionDef,
-                        description: 'Package could not be resolved',
-                        maintainers: 0,
-                        lastPublish: new Date().toISOString(),
-                        dependencies: {},
-                        isNotFound: true,
-                        source: detectSource(name, versionDef)
-                    });
-                }
-                addEdge(parentId, ghostId, 'dependency');
+            const versions = Object.keys(meta.versions);
+            if (versionDef === 'latest') {
+                resolvedVersion = meta['dist-tags'].latest || versions[versions.length - 1];
+            } else {
+                resolvedVersion = resolveVersion(versionDef, versions);
             }
 
-            resolved++;
-            onProgress?.(resolved, total);
-        }));
-    };
+            const nodeId = `${name}@${resolvedVersion}`;
 
-    while (queue.length > 0) {
-        await processQueue();
-    }
+            if (parentId) {
+                const edgeType = isPeer ? 'peer' : isDev ? 'dev' : 'dependency';
+                ctx.addEdge(parentId, nodeId, edgeType);
+            }
+
+            if (graph.nodes.has(nodeId) || inProgress.has(nodeId)) {
+                return;
+            }
+
+            inProgress.add(nodeId);
+
+            const pkgData = meta.versions[resolvedVersion];
+            if (!pkgData) {
+                throw new Error(`Version ${resolvedVersion} not found for ${name}`);
+            }
+
+            const dependencies = pkgData.dependencies || {};
+
+            // Detect module type from exports, type field, or main/module
+            let moduleType: 'cjs' | 'esm' | 'both' | undefined;
+            const hasEsm = pkgData.module || pkgData.exports?.import || (pkgData.type === 'module');
+            const hasCjs = pkgData.main || pkgData.exports?.require || (!pkgData.type || pkgData.type === 'commonjs');
+            if (hasEsm && hasCjs) moduleType = 'both';
+            else if (hasEsm) moduleType = 'esm';
+            else if (hasCjs) moduleType = 'cjs';
+
+            // Check if parent is root to identify direct dependencies
+            const isRoot = parentId === null;
+            const isDirectDep = parentId ? (graph.nodes.get(parentId)?.isRoot ?? false) : false;
+
+            // Build lists of newer versions for tooltip and detail panel first
+            const allVersions = Object.keys(meta.versions);
+            const newer = allVersions.filter(v => semver.valid(v) && semver.gt(v, resolvedVersion));
+            const newerStable = newer.filter(v => !isPrerelease(v)).sort(semver.compare);
+            const newerPrerelease = newer.filter(v => isPrerelease(v));
+
+            // Check if package is outdated (only if semver-higher releases actually exist)
+            const latestVersion = meta['dist-tags']?.latest;
+            let isOutdated = false;
+            let isPrereleaseAvailable = false;
+            let newerVersions: string[] = [];
+            let prereleaseVersions: string[] = [];
+            if (latestVersion && resolvedVersion !== latestVersion && newer.length > 0) {
+                if (isPrerelease(latestVersion) && !isPrerelease(resolvedVersion)) {
+                    isPrereleaseAvailable = true;
+                } else {
+                    isOutdated = true;
+                }
+            }
+
+            // Condense versions: show latest of each newer major,
+            // plus latest minor for current major, plus latest patch for current minor
+            const parsed = semver.parse(resolvedVersion);
+            const preByMajor = new Map<number, string>();
+            let preLatestMinor: string | undefined;
+            let preLatestPatch: string | undefined;
+            for (const v of newerPrerelease) {
+                const p = semver.parse(v);
+                if (!p) continue;
+                if (p.major > (parsed?.major ?? 0)) {
+                    const existing = preByMajor.get(p.major);
+                    if (!existing || semver.gt(v, existing)) {
+                        preByMajor.set(p.major, v);
+                    }
+                } else if (p.major === (parsed?.major ?? 0) && p.minor > (parsed?.minor ?? 0)) {
+                    if (!preLatestMinor || semver.gt(v, preLatestMinor)) {
+                        preLatestMinor = v;
+                    }
+                } else if (p.major === (parsed?.major ?? 0) && p.minor === (parsed?.minor ?? 0) && p.patch > (parsed?.patch ?? 0)) {
+                    if (!preLatestPatch || semver.gt(v, preLatestPatch)) {
+                        preLatestPatch = v;
+                    }
+                }
+            }
+            prereleaseVersions = [...preByMajor.values(), ...(preLatestMinor ? [preLatestMinor] : []), ...(preLatestPatch ? [preLatestPatch] : [])].sort(semver.compare);
+
+            const byMajor = new Map<number, string>();
+            let latestMinor: string | undefined;
+            let latestPatch: string | undefined;
+            for (const v of newerStable) {
+                const p = semver.parse(v);
+                if (!p) continue;
+                if (p.major > (parsed?.major ?? 0)) {
+                    const existing = byMajor.get(p.major);
+                    if (!existing || semver.gt(v, existing)) {
+                        byMajor.set(p.major, v);
+                    }
+                } else if (p.major === (parsed?.major ?? 0) && p.minor > (parsed?.minor ?? 0)) {
+                    if (!latestMinor || semver.gt(v, latestMinor)) {
+                        latestMinor = v;
+                    }
+                } else if (p.major === (parsed?.major ?? 0) && p.minor === (parsed?.minor ?? 0) && p.patch > (parsed?.patch ?? 0)) {
+                    if (!latestPatch || semver.gt(v, latestPatch)) {
+                        latestPatch = v;
+                    }
+                }
+            }
+            newerVersions = [...byMajor.values(), ...(latestMinor ? [latestMinor] : []), ...(latestPatch ? [latestPatch] : [])].sort(semver.compare);
+
+            // pkgData.license is already normalized to string by npm.ts fetchPackageMeta
+            const licenseStr = pkgData.license;
+
+            const size = pkgData.dist?.unpackedSize;
+            const fileCount = pkgData.dist?.fileCount;
+            const hasSizeData = size !== undefined && size > 0;
+            const isMicropackage = hasSizeData
+                ? size < MICROPACKAGE_SIZE_THRESHOLD
+                : (fileCount !== undefined && fileCount > 0 && fileCount <= 3);
+
+            graph.nodes.set(nodeId, {
+                id: nodeId,
+                pkgName: name,
+                version: resolvedVersion,
+                description: pkgData.description || meta.description,
+                maintainers: meta.maintainers?.length || pkgData.maintainers?.length || 0,
+                lastPublish: meta.time?.[resolvedVersion] || meta.time?.modified || new Date().toISOString(),
+                dependencies: dependencies,
+                isRoot,
+                isPeer: isPeer || false,
+                readme: meta.readme,
+                source: detectSource(name, versionDef),
+                moduleType,
+                repoUrl: pkgData.repository?.url || meta.repository?.url,
+                size,
+                license: licenseStr,
+                isDirectDep,
+                isOutdated: !!isOutdated,
+                isPrereleaseAvailable: !!isPrereleaseAvailable,
+                latestVersion: newerVersions.length > 0 ? newerVersions[newerVersions.length - 1] : undefined,
+                newerVersions: newerVersions.length > 0 ? newerVersions : undefined,
+                prereleaseVersions: prereleaseVersions.length > 0 ? prereleaseVersions : undefined,
+                isMicropackage
+            });
+
+            const newDeps = Object.entries(dependencies);
+            for (const [depName, depVersion] of newDeps) {
+                ctx.enqueue({ name: depName, versionDef: depVersion, parentId: nodeId });
+            }
+
+            if (options.showPeerDeps) {
+                const peerDeps = Object.entries(pkgData.peerDependencies || {});
+                for (const [peerName, peerVersion] of peerDeps) {
+                    ctx.enqueue({ name: peerName, versionDef: peerVersion, parentId: nodeId, isPeer: true });
+                }
+            }
+        }
+    });
 }
 
 /**

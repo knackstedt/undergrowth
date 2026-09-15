@@ -1,9 +1,8 @@
 import type { GoModDependency } from '../api/go';
 import { fetchPackageMeta, fetchVersionDependencies, fetchModuleSize, resolveGoVersion } from '../api/go';
-import type { DependencySource, ProgressCallback, ResolvedGraph, ResolverOptions } from './resolver';
-import { makeEdgeAdder, MICROPACKAGE_SIZE_THRESHOLD } from './resolver';
+import type { BfsQueueItem, DependencySource, ProgressCallback, ResolvedGraph, ResolverOptions } from './resolver';
+import { MICROPACKAGE_SIZE_THRESHOLD, runBfs } from './resolver';
 import { enrichBulkWithDepsDevData } from '../utils/depsdev-enrichment';
-import { AbortedError } from '../utils/retry';
 
 export interface GoModManifest {
     name: string;
@@ -12,13 +11,34 @@ export interface GoModManifest {
     dependencies: Record<string, string>;
 }
 
-interface QueueItem {
-    name: string;
-    versionDef: string;
-    parentId: string | null;
-    depth: number;
-    isOptional?: boolean;
-}
+type QueueItem = BfsQueueItem;
+
+const MAX_DEPTH = 30; // Lower depth limit for Go modules
+const MAX_OPTIONAL_DEPTH = 2; // Strict limit for optional (indirect) dependency expansion
+
+const detectGoSource = (name: string, version: string): DependencySource => {
+    // Go modules can reference:
+    // - Standard library (stdlib) - these are built-in, skip
+    // - External modules via proxy
+    // - Local replacements with file paths
+    if (version.startsWith('file://') || version.startsWith('./') || version.startsWith('../')) {
+        return 'other';
+    }
+    // Standard library packages don't have a version in go.mod
+    if (!version || version === 'builtin' || name.startsWith('internal/')) {
+        return 'other';
+    }
+    return 'go';
+};
+
+const isStdlibPackage = (name: string): boolean => {
+    // Module paths always have a domain (a dot) in the first path segment;
+    // stdlib packages never do. This covers the entire stdlib without a
+    // hand-maintained list, and never blocks real modules like
+    // golang.org/x/* or cloud.google.com/*.
+    const firstSegment = name.split('/')[0];
+    return !firstSegment.includes('.');
+};
 
 async function runBfsGoResolution(
     graph: ResolvedGraph,
@@ -28,209 +48,133 @@ async function runBfsGoResolution(
 ): Promise<void> {
     // Track resolved packages: name -> Set of resolved versions (to avoid duplicate nodes for same version)
     const resolvedPackages = new Map<string, Set<string>>();
-    const addEdge = makeEdgeAdder(graph);
-    let resolved = 0;
-    let total = queue.length;
-    const MAX_DEPTH = 30; // Lower depth limit for Go modules
-    const MAX_OPTIONAL_DEPTH = 2; // Strict limit for optional (indirect) dependency expansion
 
-    const detectGoSource = (name: string, version: string): DependencySource => {
-        // Go modules can reference:
-        // - Standard library (stdlib) - these are built-in, skip
-        // - External modules via proxy
-        // - Local replacements with file paths
-        if (version.startsWith('file://') || version.startsWith('./') || version.startsWith('../')) {
-            return 'other';
-        }
-        // Standard library packages don't have a version in go.mod
-        if (!version || version === 'builtin' || name.startsWith('internal/')) {
-            return 'other';
-        }
-        return 'go';
-    };
-
-    const isStdlibPackage = (name: string): boolean => {
-        // Module paths always have a domain (a dot) in the first path segment;
-        // stdlib packages never do. This covers the entire stdlib without a
-        // hand-maintained list, and never blocks real modules like
-        // golang.org/x/* or cloud.google.com/*.
-        const firstSegment = name.split('/')[0];
-        return !firstSegment.includes('.');
-    };
-
-    const processQueue = async () => {
-        if (options.signal?.aborted) throw new AbortedError();
-        const CONCURRENCY = 10;
-        const batch = queue.splice(0, CONCURRENCY);
-
-        await Promise.all(batch.map(async ({ name, versionDef, parentId, depth, isOptional }) => {
-            if (options.signal?.aborted) throw new AbortedError();
+    await runBfs(graph, queue, options, onProgress, {
+        ghostSource: (item) => detectGoSource(item.name, item.versionDef),
+        ghostEdgeType: (item) => item.isOptional ? 'peer' : 'dependency',
+        process: async ({ name, versionDef, parentId, depth = 0, isOptional }, ctx) => {
             // Skip stdlib packages - they don't need resolution
             if (isStdlibPackage(name)) {
-                resolved++;
-                onProgress?.(resolved, total);
                 return;
             }
 
             // Skip if we've reached max depth
             if (depth >= MAX_DEPTH) {
-                resolved++;
-                onProgress?.(resolved, total);
                 return;
             }
 
             // For optional (indirect) deps, use a much stricter depth limit
             if (isOptional && depth >= MAX_OPTIONAL_DEPTH) {
-                resolved++;
-                onProgress?.(resolved, total);
                 return;
             }
 
-            try {
-                const meta = await fetchPackageMeta(name, options.signal);
-                const resolvedName = meta.name;
+            const meta = await fetchPackageMeta(name, options.signal);
+            const resolvedName = meta.name;
 
-                // Get available versions (already sorted)
-                const versions = meta.versions;
+            // Get available versions (already sorted)
+            const versions = meta.versions;
 
-                if (versions.length === 0) {
-                    throw new Error(`No versions found for module ${resolvedName}`);
-                }
-
-                // Resolve the version based on the version requirement
-                const resolvedVersion = resolveGoVersion(versionDef, versions);
-                const nodeId = `${resolvedName}@${resolvedVersion}`;
-
-                // Check if we've already created this exact version node
-                const resolvedVersions = resolvedPackages.get(resolvedName.toLowerCase());
-                if (resolvedVersions?.has(resolvedVersion)) {
-                    // Exact version already resolved - just create edge from parent if needed
-                    if (parentId) {
-                        addEdge(parentId, nodeId, isOptional ? 'peer' : 'dependency');
-                    }
-                    resolved++;
-                    onProgress?.(resolved, total);
-                    return;
-                }
-
-                // Record this version as resolved
-                if (!resolvedPackages.has(resolvedName.toLowerCase())) {
-                    resolvedPackages.set(resolvedName.toLowerCase(), new Set());
-                }
-                resolvedPackages.get(resolvedName.toLowerCase())!.add(resolvedVersion);
-
-                // Create edge from parent
-                if (parentId) {
-                    addEdge(parentId, nodeId, isOptional ? 'peer' : 'dependency');
-                }
-
-                // Check if node already exists (same package+version already processed)
-                if (graph.nodes.has(nodeId)) {
-                    resolved++;
-                    onProgress?.(resolved, total);
-                    return;
-                }
-
-                // Fetch dependencies for this specific version
-                const rawDependencies: GoModDependency[] = await fetchVersionDependencies(resolvedName, resolvedVersion, options.signal);
-
-                // Parse dependencies - only direct (non-indirect) dependencies
-                const dependencies: Record<string, string> = {};
-                // Parse optional dependencies (indirect - only when showPeerDeps is enabled)
-                const optionalDeps: Record<string, string> = {};
-
-                for (const dep of rawDependencies) {
-                    // Skip stdlib packages
-                    if (isStdlibPackage(dep.path)) continue;
-                    
-                    if (!dep.indirect) {
-                        dependencies[dep.path] = dep.version;
-                    }
-                    // Include indirect dependencies when showPeerDeps is enabled
-                    if (options.showPeerDeps && dep.indirect) {
-                        optionalDeps[dep.path] = dep.version;
-                    }
-                }
-
-                // Fetch size asynchronously
-                const size = await fetchModuleSize(resolvedName, resolvedVersion, options.signal);
-
-                const hasSizeData = size !== undefined && size > 0;
-                const isMicropackage = hasSizeData && size < MICROPACKAGE_SIZE_THRESHOLD;
-
-                graph.nodes.set(nodeId, {
-                    id: nodeId,
-                    pkgName: resolvedName,
-                    version: resolvedVersion,
-                    description: meta.description || '',
-                    maintainers: 0, // Go proxy doesn't expose maintainer info
-                    lastPublish: '', // Go proxy doesn't expose this directly
-                    dependencies: dependencies,
-                    isRoot: parentId === null,
-                    readme: '',
-                    source: detectGoSource(resolvedName, versionDef),
-                    size,
-                    isMicropackage
-                });
-
-                // Add regular dependencies to queue
-                const newDeps = Object.entries(dependencies);
-                total += newDeps.length;
-                for (const [depName, depVersion] of newDeps) {
-                    queue.push({ name: depName, versionDef: depVersion, parentId: nodeId, depth: depth + 1 });
-                }
-
-                // Add optional (indirect) dependencies to queue as peers when showPeerDeps is enabled
-                // But only for the first level to prevent exponential explosion
-                if (options.showPeerDeps && depth < 1) {
-                    const optDepEntries = Object.entries(optionalDeps);
-                    total += optDepEntries.length;
-                    for (const [depName, depVersion] of optDepEntries) {
-                        queue.push({
-                            name: depName,
-                            versionDef: depVersion,
-                            parentId: nodeId,
-                            depth: depth + 1,
-                            isOptional: true
-                        });
-                    }
-                }
-            } catch (err: unknown) {
-                if (err instanceof AbortedError || options.signal?.aborted) throw new AbortedError();
-                const message = err instanceof Error ? err.message : 'Unknown dependency resolution error';
-                graph.errors.push({ pkg: name, error: message });
-
-                // Root package failure — re-throw so the caller can show a dialog
-                if (parentId === null) {
-                    throw err;
-                }
-
-                // If this is a dependency (not the root), add a ghost "not found" node
-                const ghostId = `${name}@${versionDef}`;
-                if (!graph.nodes.has(ghostId)) {
-                    graph.nodes.set(ghostId, {
-                        id: ghostId,
-                        pkgName: name,
-                        version: versionDef,
-                        description: 'Package could not be resolved',
-                        maintainers: 0,
-                        lastPublish: new Date().toISOString(),
-                        dependencies: {},
-                        isNotFound: true,
-                        source: detectGoSource(name, versionDef)
-                    });
-                }
-                addEdge(parentId, ghostId, isOptional ? 'peer' : 'dependency');
+            if (versions.length === 0) {
+                throw new Error(`No versions found for module ${resolvedName}`);
             }
 
-            resolved++;
-            onProgress?.(resolved, total);
-        }));
-    };
+            // Resolve the version based on the version requirement
+            const resolvedVersion = resolveGoVersion(versionDef, versions);
+            const nodeId = `${resolvedName}@${resolvedVersion}`;
 
-    while (queue.length > 0) {
-        await processQueue();
-    }
+            // Check if we've already created this exact version node
+            const resolvedVersions = resolvedPackages.get(resolvedName.toLowerCase());
+            if (resolvedVersions?.has(resolvedVersion)) {
+                // Exact version already resolved - just create edge from parent if needed
+                if (parentId) {
+                    ctx.addEdge(parentId, nodeId, isOptional ? 'peer' : 'dependency');
+                }
+                return;
+            }
+
+            // Record this version as resolved
+            if (!resolvedPackages.has(resolvedName.toLowerCase())) {
+                resolvedPackages.set(resolvedName.toLowerCase(), new Set());
+            }
+            resolvedPackages.get(resolvedName.toLowerCase())!.add(resolvedVersion);
+
+            // Create edge from parent
+            if (parentId) {
+                ctx.addEdge(parentId, nodeId, isOptional ? 'peer' : 'dependency');
+            }
+
+            // Check if node already exists (same package+version already processed)
+            if (graph.nodes.has(nodeId)) {
+                return;
+            }
+
+            // Fetch dependencies for this specific version
+            const rawDependencies: GoModDependency[] = await fetchVersionDependencies(resolvedName, resolvedVersion, options.signal);
+
+            // Parse dependencies - only direct (non-indirect) dependencies
+            const dependencies: Record<string, string> = {};
+            // Parse optional dependencies (indirect - only when showPeerDeps is enabled)
+            const optionalDeps: Record<string, string> = {};
+
+            for (const dep of rawDependencies) {
+                // Skip stdlib packages
+                if (isStdlibPackage(dep.path)) continue;
+
+                if (!dep.indirect) {
+                    dependencies[dep.path] = dep.version;
+                }
+                // Include indirect dependencies when showPeerDeps is enabled
+                if (options.showPeerDeps && dep.indirect) {
+                    optionalDeps[dep.path] = dep.version;
+                }
+            }
+
+            // Fetch size asynchronously
+            const size = await fetchModuleSize(resolvedName, resolvedVersion, options.signal);
+
+            const hasSizeData = size !== undefined && size > 0;
+            const isMicropackage = hasSizeData && size < MICROPACKAGE_SIZE_THRESHOLD;
+
+            graph.nodes.set(nodeId, {
+                id: nodeId,
+                pkgName: resolvedName,
+                version: resolvedVersion,
+                description: meta.description || '',
+                maintainers: 0, // Go proxy doesn't expose maintainer info
+                lastPublish: '', // Go proxy doesn't expose this directly
+                dependencies: dependencies,
+                isRoot: parentId === null,
+                readme: '',
+                source: detectGoSource(resolvedName, versionDef),
+                // Module paths on major forges embed the repo: host/owner/repo
+                repoUrl: /^(github\.com|gitlab\.com|bitbucket\.org)\//.test(resolvedName)
+                    ? `https://${resolvedName.split('/').slice(0, 3).join('/')}`
+                    : undefined,
+                size,
+                isMicropackage
+            });
+
+            // Add regular dependencies to queue
+            const newDeps = Object.entries(dependencies);
+            for (const [depName, depVersion] of newDeps) {
+                ctx.enqueue({ name: depName, versionDef: depVersion, parentId: nodeId, depth: depth + 1 });
+            }
+
+            // Add optional (indirect) dependencies to queue as peers when showPeerDeps is enabled
+            // But only for the first level to prevent exponential explosion
+            if (options.showPeerDeps && depth < 1) {
+                for (const [depName, depVersion] of Object.entries(optionalDeps)) {
+                    ctx.enqueue({
+                        name: depName,
+                        versionDef: depVersion,
+                        parentId: nodeId,
+                        depth: depth + 1,
+                        isOptional: true
+                    });
+                }
+            }
+        }
+    });
 }
 
 export async function resolveGoDependencyTree(

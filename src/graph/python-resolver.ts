@@ -1,8 +1,7 @@
-import { fetchPackageMeta, parseExtras, parseRequiresDist, resolvePythonVersion } from '../api/pypi';
-import type { DependencySource, ProgressCallback, ResolvedGraph, ResolverOptions } from './resolver';
-import { makeEdgeAdder, MICROPACKAGE_SIZE_THRESHOLD } from './resolver';
+import { comparePythonVersions, fetchPackageMeta, parseExtras, parseRequiresDist, resolvePythonVersion } from '../api/pypi';
+import type { BfsQueueItem, DependencySource, ProgressCallback, ResolvedGraph, ResolverOptions } from './resolver';
+import { MICROPACKAGE_SIZE_THRESHOLD, runBfs } from './resolver';
 import { enrichBulkWithDepsDevData } from '../utils/depsdev-enrichment';
-import { AbortedError } from '../utils/retry';
 
 export interface PythonRequirementsManifest {
     name: string;
@@ -11,202 +10,143 @@ export interface PythonRequirementsManifest {
     dependencies: Record<string, string>;
 }
 
+interface PyQueueItem extends BfsQueueItem {
+    isExtra?: boolean;
+}
+
+const MAX_DEPTH = 100; // Limit dependency depth to prevent explosion
+
+const detectPythonSource = (_name: string, version: string): DependencySource => {
+    if (version.startsWith('git+') || version.startsWith('git://')) return 'github';
+    if (version.startsWith('hg+') || version.startsWith('svn+') || version.startsWith('bzr+')) return 'other';
+    if (version.startsWith('http://') || version.startsWith('https://')) return 'external';
+    return 'pypi';
+};
+
 async function runBfsPythonResolution(
     graph: ResolvedGraph,
-    queue: Array<{ name: string; versionDef: string; parentId: string | null; isPeer?: boolean; isExtra?: boolean; depth?: number }>,
+    queue: PyQueueItem[],
     options: ResolverOptions = {},
     onProgress?: ProgressCallback
 ): Promise<void> {
     const inProgress = new Set<string>();
     const resolvedPackages = new Set<string>(); // Track by name to avoid re-resolving same package
-    const addEdge = makeEdgeAdder(graph);
-    let resolved = 0;
-    let total = queue.length;
-    const MAX_DEPTH = 100; // Limit dependency depth to prevent explosion
 
-    const detectPythonSource = (_name: string, version: string): DependencySource => {
-        if (version.startsWith('git+') || version.startsWith('git://')) return 'github';
-        if (version.startsWith('hg+') || version.startsWith('svn+') || version.startsWith('bzr+')) return 'other';
-        if (version.startsWith('http://') || version.startsWith('https://')) return 'external';
-        return 'pypi';
-    };
-
-    const processQueue = async () => {
-        if (options.signal?.aborted) throw new AbortedError();
-        const CONCURRENCY = 10;
-        const batch = queue.splice(0, CONCURRENCY);
-
-        await Promise.all(batch.map(async ({ name, versionDef, parentId, isPeer, isExtra, depth = 0 }) => {
-            if (options.signal?.aborted) throw new AbortedError();
+    await runBfs(graph, queue, options, onProgress, {
+        ghostSource: (item) => detectPythonSource(item.name, item.versionDef),
+        ghostEdgeType: (item) => item.isExtra ? 'extra' : 'dependency',
+        process: async ({ name, versionDef, parentId, isPeer, isExtra, depth = 0 }, ctx) => {
             // Skip if we've reached max depth
             if (depth >= MAX_DEPTH) {
-                resolved++;
-                onProgress?.(resolved, total);
                 return;
             }
 
-            let resolvedVersion = versionDef;
-
-            try {
-                // Skip if we've already resolved this package (by name) to avoid cycles
-                if (resolvedPackages.has(name.toLowerCase())) {
-                    resolved++;
-                    onProgress?.(resolved, total);
-                    return;
-                }
-
-                const meta = await fetchPackageMeta(name, options.signal);
-                resolvedPackages.add(name.toLowerCase());
-
-                const versions = Object.keys(meta.releases || {});
-                if (versions.length === 0) {
-                    throw new Error(`No releases found for package ${name}`);
-                }
-
-                // Sort versions roughly chronologically by upload time of first file
-                versions.sort((a, b) => {
-                    const filesA = meta.releases[a];
-                    const filesB = meta.releases[b];
-                    const timeA = filesA?.[0]?.upload_time || '';
-                    const timeB = filesB?.[0]?.upload_time || '';
-                    return timeA.localeCompare(timeB);
-                });
-
-                resolvedVersion = resolvePythonVersion(versionDef, versions);
-
-                const nodeId = `${name}@${resolvedVersion}`;
-
-                if (parentId) {
-                    const edgeType: 'dependency' | 'peer' | 'extra' = isExtra ? 'extra' : 'dependency';
-                    addEdge(parentId, nodeId, edgeType);
-                }
-
-                if (graph.nodes.has(nodeId) || inProgress.has(nodeId)) {
-                    resolved++;
-                    onProgress?.(resolved, total);
-                    return;
-                }
-
-                inProgress.add(nodeId);
-
-                const releaseFiles = meta.releases[resolvedVersion];
-                const uploadTime = releaseFiles?.[0]?.upload_time || '';
-
-                // Parse dependencies from requires_dist
-                const dependencies = parseRequiresDist(meta.info.requires_dist);
-
-                // Parse extras (optional dependencies)
-                const extras = parseExtras(meta.info.requires_dist);
-
-                // Compute size from release files (sum of all distribution file sizes)
-                const size = releaseFiles && releaseFiles.length > 0
-                    ? releaseFiles.reduce((sum, f) => sum + (f.size || 0), 0)
-                    : undefined;
-
-                // Compute update information from all versions sorted chronologically
-                const allVersions = Object.keys(meta.releases || {});
-                allVersions.sort((a, b) => {
-                    const filesA = meta.releases[a];
-                    const filesB = meta.releases[b];
-                    const timeA = filesA?.[0]?.upload_time || '';
-                    const timeB = filesB?.[0]?.upload_time || '';
-                    return timeA.localeCompare(timeB);
-                });
-
-                const resolvedIdx = allVersions.indexOf(resolvedVersion);
-                const newerVersions = resolvedIdx >= 0 && resolvedIdx < allVersions.length - 1
-                    ? allVersions.slice(resolvedIdx + 1)
-                    : [];
-
-                const latestVersion = allVersions.length > 0 ? allVersions[allVersions.length - 1] : resolvedVersion;
-                const isOutdated = resolvedVersion !== latestVersion && newerVersions.length > 0;
-
-                // PEP 440 prerelease detection
-                const isPythonPrerelease = (v: string): boolean => {
-                    return /(?:a|b|rc|alpha|beta|pre)\d*$/i.test(v) || /\.dev\d+$/i.test(v);
-                };
-
-                const prereleaseVersions = newerVersions.filter(isPythonPrerelease);
-                const isPrereleaseAvailable = prereleaseVersions.length > 0;
-
-                const hasSizeData = size !== undefined && size > 0;
-                const isMicropackage = hasSizeData && size < MICROPACKAGE_SIZE_THRESHOLD;
-
-                graph.nodes.set(nodeId, {
-                    id: nodeId,
-                    pkgName: name,
-                    version: resolvedVersion,
-                    description: meta.info.summary || meta.info.description || '',
-                    maintainers: meta.info.maintainer ? 1 : meta.info.author ? 1 : 0,
-                    lastPublish: uploadTime || new Date().toISOString(),
-                    dependencies: dependencies,
-                    isRoot: parentId === null,
-                    isPeer: isPeer || false,
-                    readme: meta.info.description,
-                    source: detectPythonSource(name, versionDef),
-                    size,
-                    license: meta.info.license || undefined,
-                    isOutdated,
-                    latestVersion: isOutdated ? latestVersion : undefined,
-                    newerVersions: newerVersions.length > 0 ? newerVersions : undefined,
-                    prereleaseVersions: prereleaseVersions.length > 0 ? prereleaseVersions : undefined,
-                    isPrereleaseAvailable,
-                    isMicropackage
-                });
-
-                // Add regular dependencies
-                const newDeps = Object.entries(dependencies);
-                total += newDeps.length;
-                for (const [depName, depVersion] of newDeps) {
-                    queue.push({ name: depName, versionDef: depVersion, parentId: nodeId, depth: depth + 1 });
-                }
-
-                // Add extras as optional dependencies (similar to peer deps),
-                // only when the optional-deps toggle is on — otherwise they
-                // balloon the graph with every declared extra's subtree
-                for (const extraDeps of options.showPeerDeps ? Object.values(extras) : []) {
-                    const extraDepEntries = Object.entries(extraDeps);
-                    total += extraDepEntries.length;
-                    for (const [depName, depVersion] of extraDepEntries) {
-                        queue.push({ name: depName, versionDef: depVersion, parentId: nodeId, isExtra: true, depth: depth + 1 });
-                    }
-                }
-            } catch (err: unknown) {
-                if (err instanceof AbortedError || options.signal?.aborted) throw new AbortedError();
-                const message = err instanceof Error ? err.message : 'Unknown dependency resolution error';
-                graph.errors.push({ pkg: name, error: message });
-
-                // Root package failure — re-throw so the caller can show a dialog
-                if (parentId === null) {
-                    throw err;
-                }
-
-                // If this is a dependency (not the root), add a ghost "not found" node
-                const ghostId = `${name}@${versionDef}`;
-                if (!graph.nodes.has(ghostId)) {
-                    graph.nodes.set(ghostId, {
-                        id: ghostId,
-                        pkgName: name,
-                        version: versionDef,
-                        description: 'Package could not be resolved',
-                        maintainers: 0,
-                        lastPublish: new Date().toISOString(),
-                        dependencies: {},
-                        isNotFound: true,
-                        source: detectPythonSource(name, versionDef)
-                    });
-                }
-                addEdge(parentId, ghostId, 'dependency');
+            // Skip if we've already resolved this package (by name) to avoid cycles
+            if (resolvedPackages.has(name.toLowerCase())) {
+                return;
             }
 
-            resolved++;
-            onProgress?.(resolved, total);
-        }));
-    };
+            const meta = await fetchPackageMeta(name, options.signal);
+            resolvedPackages.add(name.toLowerCase());
 
-    while (queue.length > 0) {
-        await processQueue();
-    }
+            const versions = Object.keys(meta.releases || {}).sort(comparePythonVersions);
+            if (versions.length === 0) {
+                throw new Error(`No releases found for package ${name}`);
+            }
+
+            const resolvedVersion = resolvePythonVersion(versionDef, versions);
+
+            const nodeId = `${name}@${resolvedVersion}`;
+
+            if (parentId) {
+                ctx.addEdge(parentId, nodeId, isExtra ? 'extra' : 'dependency');
+            }
+
+            if (graph.nodes.has(nodeId) || inProgress.has(nodeId)) {
+                return;
+            }
+
+            inProgress.add(nodeId);
+
+            const releaseFiles = meta.releases[resolvedVersion];
+            const uploadTime = releaseFiles?.[0]?.upload_time || '';
+
+            // Parse dependencies from requires_dist
+            const dependencies = parseRequiresDist(meta.info.requires_dist);
+
+            // Parse extras (optional dependencies)
+            const extras = parseExtras(meta.info.requires_dist);
+
+            // Compute size from release files (sum of all distribution file sizes)
+            const size = releaseFiles && releaseFiles.length > 0
+                ? releaseFiles.reduce((sum, f) => sum + (f.size || 0), 0)
+                : undefined;
+
+            // Compute update information from all versions in PEP 440 order
+            const allVersions = Object.keys(meta.releases || {}).sort(comparePythonVersions);
+
+            const resolvedIdx = allVersions.indexOf(resolvedVersion);
+            const newerVersions = resolvedIdx >= 0 && resolvedIdx < allVersions.length - 1
+                ? allVersions.slice(resolvedIdx + 1)
+                : [];
+
+            const latestVersion = allVersions.length > 0 ? allVersions[allVersions.length - 1] : resolvedVersion;
+            const isOutdated = resolvedVersion !== latestVersion && newerVersions.length > 0;
+
+            // PEP 440 prerelease detection
+            const isPythonPrerelease = (v: string): boolean => {
+                return /(?:a|b|rc|alpha|beta|pre)\d*$/i.test(v) || /\.dev\d+$/i.test(v);
+            };
+
+            const prereleaseVersions = newerVersions.filter(isPythonPrerelease);
+            const isPrereleaseAvailable = prereleaseVersions.length > 0;
+
+            const hasSizeData = size !== undefined && size > 0;
+            const isMicropackage = hasSizeData && size < MICROPACKAGE_SIZE_THRESHOLD;
+
+            graph.nodes.set(nodeId, {
+                id: nodeId,
+                pkgName: name,
+                version: resolvedVersion,
+                description: meta.info.summary || meta.info.description || '',
+                maintainers: meta.info.maintainer ? 1 : meta.info.author ? 1 : 0,
+                lastPublish: uploadTime || new Date().toISOString(),
+                dependencies: dependencies,
+                isRoot: parentId === null,
+                isPeer: isPeer || false,
+                readme: meta.info.description,
+                source: detectPythonSource(name, versionDef),
+                repoUrl: meta.info.project_urls?.['Source']
+                    || meta.info.project_urls?.['Source Code']
+                    || meta.info.project_urls?.['Repository']
+                    || meta.info.home_page
+                    || undefined,
+                size,
+                license: meta.info.license || undefined,
+                isOutdated,
+                latestVersion: isOutdated ? latestVersion : undefined,
+                newerVersions: newerVersions.length > 0 ? newerVersions : undefined,
+                prereleaseVersions: prereleaseVersions.length > 0 ? prereleaseVersions : undefined,
+                isPrereleaseAvailable,
+                isMicropackage
+            });
+
+            // Add regular dependencies
+            const newDeps = Object.entries(dependencies);
+            for (const [depName, depVersion] of newDeps) {
+                ctx.enqueue({ name: depName, versionDef: depVersion, parentId: nodeId, depth: depth + 1 });
+            }
+
+            // Add extras as optional dependencies (similar to peer deps),
+            // only when the optional-deps toggle is on — otherwise they
+            // balloon the graph with every declared extra's subtree
+            for (const extraDeps of options.showPeerDeps ? Object.values(extras) : []) {
+                for (const [depName, depVersion] of Object.entries(extraDeps)) {
+                    ctx.enqueue({ name: depName, versionDef: depVersion, parentId: nodeId, isExtra: true, depth: depth + 1 });
+                }
+            }
+        }
+    });
 }
 
 export async function resolvePythonDependencyTree(

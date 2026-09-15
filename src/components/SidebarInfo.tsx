@@ -1,4 +1,4 @@
-import { Archive, Download, ExternalLink, GitCommit, Link as LinkIcon, Users, X } from 'lucide-react';
+import { Archive, Download, ExternalLink, GitCommit, GitFork, Link as LinkIcon, Star, Users, X } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { getDownloads } from '../api/npm';
 import type { DependencySource, GraphNodeData } from '../graph/resolver';
@@ -320,6 +320,64 @@ export function SidebarInfo({ nodeData, micropackageThreshold = MICROPACKAGE_SIZ
                                                     </a>
                                                 ))}
                                             </div>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        )}
+
+                        {(nodeData.bundleSize || nodeData.repoStats || nodeData.repoUrl || nodeData.distroRepos || nodeData.librariesIo) && (
+                            <div className="glass-panel" style={{ padding: '16px', borderRadius: '8px' }}>
+                                <h4 style={{ margin: '0 0 12px 0', fontSize: '16px', color: 'var(--text-primary)', borderBottom: '1px solid var(--border-color)', paddingBottom: '8px' }}>External Metadata</h4>
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                                    {nodeData.repoUrl && (
+                                        <a href={nodeData.repoUrl} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--accent-blue)', fontSize: '13px', textDecoration: 'none', display: 'flex', alignItems: 'center', gap: '6px', wordBreak: 'break-all' }}>
+                                            <ExternalLink size={12} /> {nodeData.repoUrl.replace(/^(git\+|https?:\/\/)/, '').replace(/\.git$/, '')}
+                                        </a>
+                                    )}
+                                    {nodeData.repoStats && (
+                                        <div style={{ display: 'flex', gap: '16px', fontSize: '13px', color: 'var(--text-secondary)' }}>
+                                            <span style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                                                <Star size={13} color="var(--accent-amber)" /> {new Intl.NumberFormat('en-US').format(nodeData.repoStats.stars)}
+                                            </span>
+                                            <span style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                                                <GitFork size={13} color="var(--text-muted)" /> {new Intl.NumberFormat('en-US').format(nodeData.repoStats.forks)}
+                                            </span>
+                                            {nodeData.repoStats.pushedAt && (
+                                                <span style={{ color: 'var(--text-muted)' }}>
+                                                    pushed {nodeData.repoStats.pushedAt.split('T')[0]}
+                                                </span>
+                                            )}
+                                        </div>
+                                    )}
+                                    {nodeData.bundleSize && (
+                                        <div>
+                                            <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '4px' }}>Bundle Size (bundlephobia)</div>
+                                            <div style={{ fontSize: '13px', color: 'var(--text-primary)' }}>
+                                                {formatBytes(nodeData.bundleSize.size)} minified · {formatBytes(nodeData.bundleSize.gzip)} gzipped
+                                            </div>
+                                        </div>
+                                    )}
+                                    {nodeData.distroRepos && nodeData.distroRepos.length > 0 && (
+                                        <div>
+                                            <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '4px' }}>Available in Distros (repology)</div>
+                                            <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                                                {nodeData.distroRepos.map((repo, idx) => (
+                                                    <span key={idx} style={{ padding: '3px 8px', background: 'rgba(34, 197, 94, 0.15)', color: 'var(--accent-emerald)', borderRadius: '4px', fontSize: '12px' }}>
+                                                        {repo}
+                                                    </span>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    )}
+                                    {nodeData.librariesIo && (
+                                        <div style={{ fontSize: '13px', color: 'var(--text-secondary)', display: 'flex', gap: '16px' }}>
+                                            {nodeData.librariesIo.dependents !== undefined && (
+                                                <span>{new Intl.NumberFormat('en-US').format(nodeData.librariesIo.dependents)} dependents</span>
+                                            )}
+                                            {nodeData.librariesIo.stars !== undefined && (
+                                                <span>{new Intl.NumberFormat('en-US').format(nodeData.librariesIo.stars)} source rank stars</span>
+                                            )}
                                         </div>
                                     )}
                                 </div>
