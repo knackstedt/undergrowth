@@ -17,7 +17,7 @@ import { fetchPackageMeta } from './api/npm';
 import { parseRequirementsTxt } from './api/pypi';
 import { layoutGraph } from './graph/layout';
 import {resolvePythonDependencyTreeFromManifest} from './graph/python-resolver';
-import type { GraphNodeData } from './graph/resolver';
+import type { GraphNodeData, ResolvedGraph } from './graph/resolver';
 import {enrichGraphWithDepsDevData, resolveDependencyTree} from './graph/resolver';
 import { buildTimelineFromVersions, type TimelineVersion } from './graph/timeline';
 import { detectManifestUrl, fetchManifestFromUrl, parseManifestContent } from './utils/fetchManifest';
@@ -76,6 +76,7 @@ function App() {
   const [manifestUrl, setManifestUrl] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const comparisonAbortRef = useRef<Partial<Record<'left' | 'right', AbortController>>>({});
+  const timelineGraphCacheRef = useRef<Map<string, ResolvedGraph>>(new Map());
   const viewportContext = useContext(ViewportContext);
   const [copied, setCopied] = useState(false);
 
@@ -407,7 +408,7 @@ function App() {
 
     const interval = setInterval(() => {
       const viewport = viewportContext.getViewport();
-      updateURL(
+      const url = buildURL(
         lastSearchedRegistry,
         lastSearchedInput,
         warningToggles,
@@ -418,6 +419,11 @@ function App() {
         undefined,
         micropackageThreshold
       );
+      // Skip the replaceState when the encoded state hasn't changed —
+      // avoids a history write every 500ms while the viewport is idle
+      if (window.location.hash !== url) {
+        window.history.replaceState(null, '', url);
+      }
     }, 500); // Update every 500ms
 
     return () => clearInterval(interval);
@@ -1098,8 +1104,8 @@ function App() {
       const queue = [startId];
       const visited = new Set<string>([startId]);
 
-      while (queue.length > 0) {
-        const current = queue.shift()!;
+      for (let i = 0; i < queue.length; i++) {
+        const current = queue[i];
         for (const next of neighbors.get(current) || []) {
           targetEdges.add(`${current}->${next}`);
           if (visited.has(next)) continue;
@@ -1113,6 +1119,28 @@ function App() {
     walk(selectedNode, outgoing, downstreamNodes, downstreamEdges);
     walk(selectedNode, incoming, upstreamNodes, upstreamEdges);
 
+    // Nodes reachable from any root WITHOUT passing through the selected node.
+    // Computed once — a purely-downstream node is "dedicated" iff it isn't in
+    // this set (previously this BFS ran once per downstream node).
+    const reachableFromRoot = new Set<string>();
+    const rootQueue: string[] = [];
+    for (const n of nodesWithWarnings) {
+      if (n.data.isRoot && n.id !== selectedNode) {
+        rootQueue.push(n.id);
+        reachableFromRoot.add(n.id);
+      }
+    }
+    for (let i = 0; i < rootQueue.length; i++) {
+      const current = rootQueue[i];
+      for (const next of outgoing.get(current) || []) {
+        if (next === selectedNode) continue; // blocked by selected node
+        if (!reachableFromRoot.has(next)) {
+          reachableFromRoot.add(next);
+          rootQueue.push(next);
+        }
+      }
+    }
+
     const highlightedNodes = nodesWithWarnings.map((node) => {
       let relationship: 'selected' | 'upstream' | 'downstream' | 'dedicated' | 'both' | 'dimmed' = 'dimmed';
       if (node.id === selectedNode) {
@@ -1122,31 +1150,7 @@ function App() {
       } else if (upstreamNodes.has(node.id)) {
         relationship = 'upstream';
       } else if (downstreamNodes.has(node.id)) {
-        let isDedicated = true;
-        // Check if there are any paths to this purely downstream node from the root that DO NOT pass through selectedNode
-        // We can do this explicitly by running a quick BFS/DFS from the roots IGNORING the selected node
-        const reachableFromRoot = new Set<string>();
-        const queue: string[] = [];
-        for (const [id, n] of nodesWithWarnings.map(n => [n.id, n] as const)) {
-          if (n.data.isRoot && n.id !== selectedNode) {
-            queue.push(id);
-            reachableFromRoot.add(id);
-          }
-        }
-
-        while (queue.length > 0) {
-          const current = queue.shift()!;
-          for (const next of outgoing.get(current) || []) {
-            if (next === selectedNode) continue; // blocked by selected node
-            if (!reachableFromRoot.has(next)) {
-              reachableFromRoot.add(next);
-              queue.push(next);
-            }
-          }
-        }
-
-        isDedicated = !reachableFromRoot.has(node.id);
-        relationship = isDedicated ? 'dedicated' : 'downstream';
+        relationship = reachableFromRoot.has(node.id) ? 'downstream' : 'dedicated';
       }
 
       const isDimmed = relationship === 'dimmed';
@@ -1163,6 +1167,8 @@ function App() {
       };
     });
 
+    const relationshipByNode = new Map(highlightedNodes.map(n => [n.id, n.data.relationship]));
+
     const highlightedEdges = graphData.edges.map((edge) => {
       const forwardKey = `${edge.source}->${edge.target}`;
       const reverseKey = `${edge.target}->${edge.source}`;
@@ -1176,12 +1182,7 @@ function App() {
         relationship = 'upstream';
       } else if (isDownstream) {
         // Find if target node is dedicated
-        const targetNode = highlightedNodes.find(n => n.id === edge.target);
-        if (targetNode?.data.relationship === 'dedicated') {
-          relationship = 'dedicated';
-        } else {
-          relationship = 'downstream';
-        }
+        relationship = relationshipByNode.get(edge.target) === 'dedicated' ? 'dedicated' : 'downstream';
       }
 
       let stroke = edge.type === 'peer' || edge.type === 'extra' ? '#c084fc' : 'var(--text-muted)';
@@ -1361,6 +1362,7 @@ function App() {
                   const meta = await fetchPackageMeta(lastSearchedInput);
                   const timeline = buildTimelineFromVersions(meta.versions, meta.time);
                   setTimelineVersions(timeline);
+                  timelineGraphCacheRef.current.clear();
                   setIsTimelineMode(true);
                   setErrorLine(null);
                 } catch (err) {
@@ -1433,8 +1435,12 @@ function App() {
             registry={lastSearchedRegistry}
             versions={timelineVersions}
             fetchGraphForVersion={async (version) => {
+              const cached = timelineGraphCacheRef.current.get(version);
+              if (cached) return cached;
               const { resolveDependencyTree } = await import('./graph/resolver');
-              return await resolveDependencyTree(lastSearchedInput, version, { showPeerDeps });
+              const graph = await resolveDependencyTree(lastSearchedInput, version, { showPeerDeps });
+              timelineGraphCacheRef.current.set(version, graph);
+              return graph;
             }}
             onClose={() => setIsTimelineMode(false)}
           />

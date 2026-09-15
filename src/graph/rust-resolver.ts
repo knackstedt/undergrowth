@@ -1,6 +1,6 @@
 import { fetchPackageMeta, fetchVersionDependencies, resolveCargoVersion } from '../api/crates';
 import type { DependencySource, ProgressCallback, ResolvedGraph, ResolverOptions } from './resolver';
-import { MICROPACKAGE_SIZE_THRESHOLD } from './resolver';
+import { makeEdgeAdder, MICROPACKAGE_SIZE_THRESHOLD } from './resolver';
 import { enrichBulkWithDepsDevData } from '../utils/depsdev-enrichment';
 import { AbortedError } from '../utils/retry';
 
@@ -27,8 +27,7 @@ async function runBfsRustResolution(
 ): Promise<void> {
     // Track resolved packages: name -> Set of resolved versions (to avoid duplicate nodes for same version)
     const resolvedPackages = new Map<string, Set<string>>();
-    // Track which optional dependency edges have already been created to prevent cycles
-    const resolvedOptionalEdges = new Set<string>();
+    const addEdge = makeEdgeAdder(graph);
     let resolved = 0;
     let total = queue.length;
     const MAX_DEPTH = 30; // Lower depth limit for peer deps
@@ -89,18 +88,7 @@ async function runBfsRustResolution(
                 if (resolvedVersions?.has(resolvedVersion)) {
                     // Exact version already resolved - just create edge from parent if needed
                     if (parentId) {
-                        const edgeKey = `${parentId}->${nodeId}`;
-                        if (!resolvedOptionalEdges.has(edgeKey)) {
-                            resolvedOptionalEdges.add(edgeKey);
-                            const edgeExists = graph.edges.find(e => e.source === parentId && e.target === nodeId);
-                            if (!edgeExists) {
-                                graph.edges.push({
-                                    source: parentId,
-                                    target: nodeId,
-                                    type: isOptional ? 'peer' : 'dependency'
-                                });
-                            }
-                        }
+                        addEdge(parentId, nodeId, isOptional ? 'peer' : 'dependency');
                     }
                     resolved++;
                     onProgress?.(resolved, total);
@@ -115,16 +103,7 @@ async function runBfsRustResolution(
 
                 // Create edge from parent
                 if (parentId) {
-                    const edgeKey = `${parentId}->${nodeId}`;
-                    resolvedOptionalEdges.add(edgeKey);
-                    const edgeExists = graph.edges.find(e => e.source === parentId && e.target === nodeId);
-                    if (!edgeExists) {
-                        graph.edges.push({ 
-                            source: parentId, 
-                            target: nodeId, 
-                            type: isOptional ? 'peer' : 'dependency' 
-                        });
-                    }
+                    addEdge(parentId, nodeId, isOptional ? 'peer' : 'dependency');
                 }
 
                 // Check if node already exists (same package+version already processed)
@@ -221,13 +200,8 @@ async function runBfsRustResolution(
                         isNotFound: true,
                         source: detectRustSource(name, versionDef)
                     });
-                    graph.edges.push({ source: parentId, target: ghostId, type: isOptional ? 'peer' : 'dependency' });
-                } else {
-                    const edgeExists = graph.edges.find(e => e.source === parentId && e.target === ghostId);
-                    if (!edgeExists) {
-                        graph.edges.push({ source: parentId, target: ghostId, type: isOptional ? 'peer' : 'dependency' });
-                    }
                 }
+                addEdge(parentId, ghostId, isOptional ? 'peer' : 'dependency');
             }
 
             resolved++;

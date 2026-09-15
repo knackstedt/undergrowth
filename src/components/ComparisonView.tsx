@@ -165,11 +165,6 @@ export function ComparisonView({ left, right, onNodeClick, fitViewSignalLeft, fi
                     }
                 }
 
-                // DEBUG: Log computed status
-                if (status !== 'unchanged') {
-                    // console.log(`[ComparisonView] ${data.pkgName}@${data.version} is ${status}`);
-                }
-
                 // Apply styles based on status
                 let borderColor: string | undefined;
                 let backgroundColor: string | undefined;
@@ -222,28 +217,8 @@ export function ComparisonView({ left, right, onNodeClick, fitViewSignalLeft, fi
             });
         };
 
-        // DEBUG: Log map contents
-        // console.log('[ComparisonView] leftPkgMap keys:', [...leftPkgMap.keys()].slice(0, 5), 'total:', leftPkgMap.size);
-        // console.log('[ComparisonView] rightPkgMap keys:', [...rightPkgMap.keys()].slice(0, 5), 'total:', rightPkgMap.size);
-
         const leftResult = processNodes(left.nodes, rightPkgMap, false);
         const rightResult = processNodes(right.nodes, leftPkgMap, true);
-
-        // DEBUG: Log results
-        const leftUpdated = leftResult.filter(n => n.data.comparisonStatus === 'updated').map(n => `${n.data.pkgName}@${n.data.version}`);
-        const rightUpdated = rightResult.filter(n => n.data.comparisonStatus === 'updated').map(n => `${n.data.pkgName}@${n.data.version}`);
-        const leftOnly = leftUpdated.filter(id => !rightUpdated.includes(id));
-        const rightOnly = rightUpdated.filter(id => !leftUpdated.includes(id));
-        console.log(`[ComparisonView] Updated counts - left: ${leftUpdated.length}, right: ${rightUpdated.length}`);
-        
-        // Check ms versions
-        const leftMs = leftPkgMap.get('ms');
-        const rightMs = rightPkgMap.get('ms');
-        console.log('[ComparisonView] ms on left:', leftMs ? [...leftMs] : 'undefined');
-        console.log('[ComparisonView] ms on right:', rightMs ? [...rightMs] : 'undefined');
-        
-        if (leftOnly.length > 0) console.log('[ComparisonView] Only on left updated:', leftOnly.slice(0, 10));
-        if (rightOnly.length > 0) console.log('[ComparisonView] Only on right updated:', rightOnly.slice(0, 10));
 
         return {
             leftNodesWithDiff: leftResult,

@@ -1,5 +1,6 @@
 import { fetchPackageMeta, fetchVersionDependencies, getBestDependencyGroup, resolveNuGetVersion } from '../api/nuget';
 import type { DependencySource, ProgressCallback, ResolvedGraph, ResolverOptions } from './resolver';
+import { makeEdgeAdder } from './resolver';
 import { enrichBulkWithDepsDevData } from '../utils/depsdev-enrichment';
 import { AbortedError } from '../utils/retry';
 
@@ -20,6 +21,7 @@ async function runBfsCSharpResolution(
 ): Promise<void> {
     const inProgress = new Set<string>();
     const resolvedPackages = new Set<string>();
+    const addEdge = makeEdgeAdder(graph);
     let resolved = 0;
     let total = queue.length;
     const MAX_DEPTH = 100;
@@ -63,10 +65,7 @@ async function runBfsCSharpResolution(
                 const nodeId = `${name}@${resolvedVersion}`;
 
                 if (parentId) {
-                    const edgeType = isPeer ? 'peer' : 'dependency';
-                    if (!graph.edges.find(e => e.source === parentId && e.target === nodeId)) {
-                        graph.edges.push({ source: parentId, target: nodeId, type: edgeType });
-                    }
+                    addEdge(parentId, nodeId, isPeer ? 'peer' : 'dependency');
                 }
 
                 if (graph.nodes.has(nodeId) || inProgress.has(nodeId)) {
@@ -137,10 +136,8 @@ async function runBfsCSharpResolution(
                         isNotFound: true,
                         source: detectCSharpSource()
                     });
-                    graph.edges.push({ source: parentId, target: ghostId, type: 'dependency' });
-                } else if (!graph.edges.find(e => e.source === parentId && e.target === ghostId)) {
-                    graph.edges.push({ source: parentId, target: ghostId, type: 'dependency' });
                 }
+                addEdge(parentId, ghostId, 'dependency');
             }
 
             resolved++;

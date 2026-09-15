@@ -1,6 +1,6 @@
 import { fetchPackageMeta, parseExtras, parseRequiresDist, resolvePythonVersion } from '../api/pypi';
 import type { DependencySource, ProgressCallback, ResolvedGraph, ResolverOptions } from './resolver';
-import { MICROPACKAGE_SIZE_THRESHOLD } from './resolver';
+import { makeEdgeAdder, MICROPACKAGE_SIZE_THRESHOLD } from './resolver';
 import { enrichBulkWithDepsDevData } from '../utils/depsdev-enrichment';
 import { AbortedError } from '../utils/retry';
 
@@ -19,6 +19,7 @@ async function runBfsPythonResolution(
 ): Promise<void> {
     const inProgress = new Set<string>();
     const resolvedPackages = new Set<string>(); // Track by name to avoid re-resolving same package
+    const addEdge = makeEdgeAdder(graph);
     let resolved = 0;
     let total = queue.length;
     const MAX_DEPTH = 100; // Limit dependency depth to prevent explosion
@@ -77,9 +78,7 @@ async function runBfsPythonResolution(
 
                 if (parentId) {
                     const edgeType: 'dependency' | 'peer' | 'extra' = isExtra ? 'extra' : 'dependency';
-                    if (!graph.edges.find(e => e.source === parentId && e.target === nodeId)) {
-                        graph.edges.push({ source: parentId, target: nodeId, type: edgeType });
-                    }
+                    addEdge(parentId, nodeId, edgeType);
                 }
 
                 if (graph.nodes.has(nodeId) || inProgress.has(nodeId)) {
@@ -196,10 +195,8 @@ async function runBfsPythonResolution(
                         isNotFound: true,
                         source: detectPythonSource(name, versionDef)
                     });
-                    graph.edges.push({ source: parentId, target: ghostId, type: 'dependency' });
-                } else if (!graph.edges.find(e => e.source === parentId && e.target === ghostId)) {
-                    graph.edges.push({ source: parentId, target: ghostId, type: 'dependency' });
                 }
+                addEdge(parentId, ghostId, 'dependency');
             }
 
             resolved++;

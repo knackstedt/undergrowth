@@ -172,6 +172,20 @@ function detectDependencyCycles(
 
 export type ProgressCallback = (resolved: number, total: number) => void;
 
+/**
+ * Returns a deduplicating edge appender — replaces the O(E) `edges.find`
+ * checks that made graph construction O(E²).
+ */
+export function makeEdgeAdder(graph: ResolvedGraph) {
+    const seen = new Set(graph.edges.map(e => `${e.source}->${e.target}`));
+    return (source: string, target: string, type: 'dependency' | 'peer' | 'dev' | 'extra') => {
+        const key = `${source}->${target}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        graph.edges.push({ source, target, type });
+    };
+}
+
 export interface ResolverOptions {
     showPeerDeps?: boolean;
     signal?: AbortSignal;
@@ -184,6 +198,7 @@ async function runBfsResolution(
     onProgress?: ProgressCallback
 ): Promise<void> {
     const inProgress = new Set<string>();
+    const addEdge = makeEdgeAdder(graph);
     let resolved = 0;
     let total = queue.length;
 
@@ -210,9 +225,7 @@ async function runBfsResolution(
 
                 if (parentId) {
                     const edgeType = isPeer ? 'peer' : isDev ? 'dev' : 'dependency';
-                    if (!graph.edges.find(e => e.source === parentId && e.target === nodeId)) {
-                        graph.edges.push({ source: parentId, target: nodeId, type: edgeType });
-                    }
+                    addEdge(parentId, nodeId, edgeType);
                 }
 
                 if (graph.nodes.has(nodeId) || inProgress.has(nodeId)) {
@@ -383,10 +396,8 @@ async function runBfsResolution(
                         isNotFound: true,
                         source: detectSource(name, versionDef)
                     });
-                    graph.edges.push({ source: parentId, target: ghostId, type: 'dependency' });
-                } else if (!graph.edges.find(e => e.source === parentId && e.target === ghostId)) {
-                    graph.edges.push({ source: parentId, target: ghostId, type: 'dependency' });
                 }
+                addEdge(parentId, ghostId, 'dependency');
             }
 
             resolved++;

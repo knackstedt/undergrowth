@@ -47,8 +47,6 @@ export interface DepsDevVersionInfo {
     links?: DepsDevLink[];
 }
 
-const inFlightCache = new Map<string, Promise<DepsDevPackage | DepsDevVersionInfo>>();
-
 function encodePackageName(name: string): string {
     return encodeURIComponent(name).replace(/%2F/g, '%252F');
 }
@@ -60,42 +58,29 @@ function systemToString(system: PackageSystem): string {
 export async function fetchPackage(system: PackageSystem, name: string, signal?: AbortSignal): Promise<DepsDevPackage> {
     const cacheKey = `depsdev:package:${system}:${name}`;
 
-    if (inFlightCache.has(cacheKey)) {
-        return inFlightCache.get(cacheKey)! as Promise<DepsDevPackage>;
-    }
-
     const fetchAndCache = async (): Promise<DepsDevPackage> => {
-        try {
-            return await withRetry(async () => {
-                const encodedName = encodePackageName(name);
-                const systemStr = systemToString(system);
-                const url = `https://api.deps.dev/v3/systems/${systemStr}/packages/${encodedName}`;
+        return await withRetry(async () => {
+            const encodedName = encodePackageName(name);
+            const systemStr = systemToString(system);
+            const url = `https://api.deps.dev/v3/systems/${systemStr}/packages/${encodedName}`;
 
-                const res = await fetch(url, { signal });
-                
-                if (res.status >= 400 && res.status < 500) {
-                    throw new PermanentError(`Package "${name}" not found in deps.dev (${res.status})`);
-                }
-                
-                if (!res.ok) {
-                    throw new Error(`Failed to fetch package from deps.dev: ${res.statusText} (${res.status})`);
-                }
-                
-                const data = await res.json() as DepsDevPackage;
+            const res = await fetch(url, { signal });
+            
+            if (res.status >= 400 && res.status < 500) {
+                throw new PermanentError(`Package "${name}" not found in deps.dev (${res.status})`);
+            }
+            
+            if (!res.ok) {
+                throw new Error(`Failed to fetch package from deps.dev: ${res.statusText} (${res.status})`);
+            }
+            
+            const data = await res.json() as DepsDevPackage;
 
-                await PersistentCache.setRegistry(cacheKey, data);
-
-                return data;
-            }, 5, 2500, signal);
-        } catch (err) {
-            inFlightCache.delete(cacheKey);
-            throw err;
-        }
+            return data;
+        }, 5, 2500, signal);
     };
 
-    const promise = PersistentCache.getOrComputeRegistry(cacheKey, fetchAndCache);
-    inFlightCache.set(cacheKey, promise);
-    return promise;
+    return PersistentCache.getOrComputeRegistry(cacheKey, fetchAndCache);
 }
 
 export async function fetchVersionInfo(
@@ -106,43 +91,30 @@ export async function fetchVersionInfo(
 ): Promise<DepsDevVersionInfo> {
     const cacheKey = `depsdev:version:${system}:${name}:${version}`;
 
-    if (inFlightCache.has(cacheKey)) {
-        return inFlightCache.get(cacheKey)! as Promise<DepsDevVersionInfo>;
-    }
-
     const fetchAndCache = async (): Promise<DepsDevVersionInfo> => {
-        try {
-            return await withRetry(async () => {
-                const encodedName = encodePackageName(name);
-                const encodedVersion = encodeURIComponent(version);
-                const systemStr = systemToString(system);
-                const url = `https://api.deps.dev/v3/systems/${systemStr}/packages/${encodedName}/versions/${encodedVersion}`;
+        return await withRetry(async () => {
+            const encodedName = encodePackageName(name);
+            const encodedVersion = encodeURIComponent(version);
+            const systemStr = systemToString(system);
+            const url = `https://api.deps.dev/v3/systems/${systemStr}/packages/${encodedName}/versions/${encodedVersion}`;
 
-                const res = await fetch(url, { signal });
-                
-                if (res.status >= 400 && res.status < 500) {
-                    throw new PermanentError(`Version "${version}" of package "${name}" not found in deps.dev (${res.status})`);
-                }
-                
-                if (!res.ok) {
-                    throw new Error(`Failed to fetch version from deps.dev: ${res.statusText} (${res.status})`);
-                }
-                
-                const data = await res.json() as DepsDevVersionInfo;
+            const res = await fetch(url, { signal });
+            
+            if (res.status >= 400 && res.status < 500) {
+                throw new PermanentError(`Version "${version}" of package "${name}" not found in deps.dev (${res.status})`);
+            }
+            
+            if (!res.ok) {
+                throw new Error(`Failed to fetch version from deps.dev: ${res.statusText} (${res.status})`);
+            }
+            
+            const data = await res.json() as DepsDevVersionInfo;
 
-                await PersistentCache.setRegistry(cacheKey, data);
-
-                return data;
-            }, 5, 2500, signal);
-        } catch (err) {
-            inFlightCache.delete(cacheKey);
-            throw err;
-        }
+            return data;
+        }, 5, 2500, signal);
     };
 
-    const promise = PersistentCache.getOrComputeRegistry(cacheKey, fetchAndCache);
-    inFlightCache.set(cacheKey, promise);
-    return promise;
+    return PersistentCache.getOrComputeRegistry(cacheKey, fetchAndCache);
 }
 
 export function getSecurityAdvisories(versionInfo: DepsDevVersionInfo): string[] {

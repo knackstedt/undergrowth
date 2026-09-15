@@ -224,27 +224,12 @@ export function TimelineView({
                 graph
             );
 
-            console.log(`[Timeline] Version ${version.version}:`, {
-                previousNodeCount: prevGraph?.nodes.size || 0,
-                currentNodeCount: graph.nodes.size,
-                added: diff.added.length,
-                removed: diff.removed.length,
-                updated: diff.updated.length,
-                unchanged: diff.unchanged.length,
-                previousIds: prevGraph ? Array.from(prevGraph.nodes.keys()).slice(0, 5) : [],
-                currentIds: Array.from(graph.nodes.keys()).slice(0, 5)
-            });
-
             // Convert to get proper timeline status - pass nextGraph to mark nodes that will be removed
             const { nodes: flowNodes, edges: flowEdges } = convertToTimelineGraph(
                 graph,
                 diff,
                 previousStateRef.current,
                 nextGraph
-            );
-
-            console.log(`[Timeline] Flow nodes for ${version.version}:`,
-                flowNodes.map(n => ({ id: n.id, status: n.data.timelineStatus })).slice(0, 10)
             );
 
             // Apply cached positions
@@ -314,14 +299,7 @@ export function TimelineView({
                 graph
             );
 
-            console.log(`[Timeline] (non-cached) Version ${version.version}:`, {
-                previousNodeCount: prevGraph?.nodes.size || 0,
-                currentNodeCount: graph.nodes.size,
-                added: diff.added.length,
-                removed: diff.removed.length,
-                updated: diff.updated.length,
-                unchanged: diff.unchanged.length
-            });
+
 
             // Convert to React Flow format with timeline status - pass nextGraph
             const { nodes: flowNodes, edges: flowEdges } = convertToTimelineGraph(
@@ -516,9 +494,8 @@ export function TimelineView({
         setIsPlaying(false);
     }, []);
 
-    const handleNodeClick = useCallback((nodeId: string | null) => {
+    const handleNodeClick = useCallback((_nodeId: string | null) => {
         // Could show node details in a sidebar
-        console.log('Timeline node clicked:', nodeId);
     }, []);
 
     // Cleanup on unmount

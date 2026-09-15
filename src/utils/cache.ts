@@ -118,26 +118,13 @@ export const PersistentCache = {
      * Get registry data from cache
      */
     async getRegistry<T>(key: string): Promise<T | null> {
-        const data = await get<T>(STORE_REGISTRY, key, REGISTRY_TTL);
-        if (data) {
-            // DEBUG: Check if license data is in cached data
-            const pkgName = key.replace('npm:', '');
-            const versions = (data as { versions?: Record<string, { license?: string }> })?.versions || {};
-            const firstVersion = Object.values(versions)[0];
-            console.log(`[Cache Get] ${pkgName} from IndexedDB has license:`, JSON.stringify(firstVersion?.license));
-        }
-        return data;
+        return get<T>(STORE_REGISTRY, key, REGISTRY_TTL);
     },
 
     /**
      * Set registry data in cache
      */
     async setRegistry<T>(key: string, data: T): Promise<void> {
-        // DEBUG: Verify license is in data being stored
-        const pkgName = key.replace('npm:', '');
-        const versions = (data as { versions?: Record<string, { license?: string }> })?.versions || {};
-        const firstVersion = Object.values(versions)[0];
-        console.log(`[Cache Set] ${pkgName} storing to IndexedDB with license:`, JSON.stringify(firstVersion?.license));
         return set<T>(STORE_REGISTRY, key, data);
     },
 

@@ -1,6 +1,6 @@
 import semver from 'semver';
 import { PersistentCache } from '../utils/cache';
-import { PermanentError, withRetry } from '../utils/retry';
+import { isAbortError, PermanentError, withRetry } from '../utils/retry';
 
 export interface GoModuleVersion {
     Version: string;
@@ -43,9 +43,6 @@ function encodeModulePath(modulePath: string): string {
 
 const GOPROXY_BASE = 'https://proxy.golang.org';
 
-// In-memory cache for in-flight requests (prevents duplicate concurrent fetches)
-const inFlightCache = new Map<string, Promise<GoModuleMeta>>();
-
 interface GitHubRepo {
     full_name: string;
     stargazers_count: number;
@@ -77,7 +74,8 @@ async function searchGoModule(shortName: string, signal?: AbortSignal): Promise<
             return `github.com/${bestMatch.full_name}`;
         }
         return null;
-    } catch {
+    } catch (err) {
+        if (isAbortError(err)) throw err;
         return null;
     }
 }
@@ -85,12 +83,7 @@ async function searchGoModule(shortName: string, signal?: AbortSignal): Promise<
 export async function fetchPackageMeta(name: string, signal?: AbortSignal): Promise<GoModuleMeta> {
     const cacheKey = `go:${name.toLowerCase()}`;
 
-    // Check in-memory cache for in-flight requests first
-    if (inFlightCache.has(cacheKey)) {
-        return inFlightCache.get(cacheKey)!;
-    }
-
-    // Use persistent cache with fallback to fetch
+    // getOrComputeRegistry dedupes concurrent fetches and caches results with TTL
     const fetchAndCache = async (): Promise<GoModuleMeta> => {
         let resolvedName = name;
 
@@ -107,76 +100,61 @@ export async function fetchPackageMeta(name: string, signal?: AbortSignal): Prom
             }
         }
 
-        try {
-            return await withRetry(async () => {
-                const encodedPath = encodeModulePath(resolvedName);
+        return await withRetry(async () => {
+            const encodedPath = encodeModulePath(resolvedName);
 
-                // Fetch the list of versions
-                const listRes = await fetch(`${GOPROXY_BASE}/${encodedPath}/@v/list`, { signal });
-                if (listRes.status >= 400 && listRes.status < 500) {
-                    throw new PermanentError(`Module "${resolvedName}" not found (${listRes.status})`);
-                }
-                if (!listRes.ok) {
-                    throw new Error(`Failed to fetch module ${resolvedName}: ${listRes.statusText} (${listRes.status})`);
-                }
+            // Fetch the list of versions
+            const listRes = await fetch(`${GOPROXY_BASE}/${encodedPath}/@v/list`, { signal });
+            if (listRes.status >= 400 && listRes.status < 500) {
+                throw new PermanentError(`Module "${resolvedName}" not found (${listRes.status})`);
+            }
+            if (!listRes.ok) {
+                throw new Error(`Failed to fetch module ${resolvedName}: ${listRes.statusText} (${listRes.status})`);
+            }
 
-                const versionsText = await listRes.text();
-                const versions = versionsText.trim().split('\n').filter(v => v);
+            const versionsText = await listRes.text();
+            const versions = versionsText.trim().split('\n').filter(v => v);
 
-                if (versions.length === 0) {
-                    throw new Error(`No versions found for module ${resolvedName}`);
-                }
+            if (versions.length === 0) {
+                throw new Error(`No versions found for module ${resolvedName}`);
+            }
 
-                // @v/list is not guaranteed to be sorted — order by semver
-                versions.sort((a, b) => {
-                    const va = semver.valid(a) ? a : semver.coerce(a)?.version;
-                    const vb = semver.valid(b) ? b : semver.coerce(b)?.version;
-                    if (va && vb) return semver.compare(va, vb);
-                    if (va) return -1;
-                    if (vb) return 1;
-                    return a.localeCompare(b);
-                });
+            // @v/list is not guaranteed to be sorted — order by semver
+            versions.sort((a, b) => {
+                const va = semver.valid(a) ? a : semver.coerce(a)?.version;
+                const vb = semver.valid(b) ? b : semver.coerce(b)?.version;
+                if (va && vb) return semver.compare(va, vb);
+                if (va) return -1;
+                if (vb) return 1;
+                return a.localeCompare(b);
+            });
 
-                // Get the latest version
-                const latestVersion = versions[versions.length - 1];
+            // Get the latest version
+            const latestVersion = versions[versions.length - 1];
 
-                // Fetch the go.mod file for the latest version to get dependencies
-                const modRes = await fetch(`${GOPROXY_BASE}/${encodedPath}/@v/${latestVersion}.mod`, { signal });
-                let dependencies: GoModDependency[] = [];
+            // Fetch the go.mod file for the latest version to get dependencies
+            const modRes = await fetch(`${GOPROXY_BASE}/${encodedPath}/@v/${latestVersion}.mod`, { signal });
+            let dependencies: GoModDependency[] = [];
 
-                if (modRes.ok) {
-                    const modContent = await modRes.text();
-                    dependencies = parseGoMod(modContent);
-                }
+            if (modRes.ok) {
+                const modContent = await modRes.text();
+                dependencies = parseGoMod(modContent);
+            }
 
-                const result = {
-                    name: resolvedName,
-                    versions,
-                    latestVersion,
-                    description: '', // Go proxy doesn't provide descriptions
-                    dependencies
-                };
+            const result = {
+                name: resolvedName,
+                versions,
+                latestVersion,
+                description: '', // Go proxy doesn't provide descriptions
+                dependencies
+            };
 
-                // Cache the result
-                await PersistentCache.setRegistry(cacheKey, result);
-
-                return result;
-            }, 5, 2500, signal);
-        } catch (err) {
-            // Remove from in-flight cache on failure
-            inFlightCache.delete(cacheKey);
-            throw err;
-        }
+            return result;
+        }, 5, 2500, signal);
     };
 
-    // Use persistent cache with TTL
-    const promise = PersistentCache.getOrComputeRegistry(cacheKey, fetchAndCache);
-    inFlightCache.set(cacheKey, promise);
-    return promise;
+    return PersistentCache.getOrComputeRegistry(cacheKey, fetchAndCache);
 }
-
-// In-memory cache for in-flight dependency requests
-const inFlightDepCache = new Map<string, Promise<GoModDependency[]>>();
 
 /**
  * Fetch dependencies for a specific version of a module.
@@ -188,39 +166,25 @@ export async function fetchVersionDependencies(
 ): Promise<GoModDependency[]> {
     const cacheKey = `go:deps:${name.toLowerCase()}:${version}`;
 
-    // Check in-memory cache for in-flight requests first
-    if (inFlightDepCache.has(cacheKey)) {
-        return inFlightDepCache.get(cacheKey)!;
-    }
-
-    // Use persistent cache with fallback to fetch
     const fetchAndCache = async (): Promise<GoModDependency[]> => {
-        try {
-            return await withRetry(async () => {
-                const encodedPath = encodeModulePath(name);
-                const res = await fetch(`${GOPROXY_BASE}/${encodedPath}/@v/${version}.mod`, { signal });
-                if (!res.ok) {
-                    throw new Error(`Failed to fetch go.mod: ${res.statusText} (${res.status})`);
-                }
-                const content = await res.text();
-                const deps = parseGoMod(content);
+        return await withRetry(async () => {
+            const encodedPath = encodeModulePath(name);
+            const res = await fetch(`${GOPROXY_BASE}/${encodedPath}/@v/${version}.mod`, { signal });
+            if (!res.ok) {
+                throw new Error(`Failed to fetch go.mod: ${res.statusText} (${res.status})`);
+            }
+            const content = await res.text();
+            const deps = parseGoMod(content);
 
-                // Cache the result
-                await PersistentCache.setRegistry(cacheKey, deps);
-
-                return deps;
-            }, 5, 2500, signal);
-        } catch (err) {
-            // Remove from in-flight cache on failure
-            inFlightDepCache.delete(cacheKey);
-            throw err;
-        }
+            return deps;
+        }, 5, 2500, signal);
     };
 
-    // Use persistent cache with TTL
-    const promise = PersistentCache.getOrComputeRegistry(cacheKey, fetchAndCache).catch(() => []);
-    inFlightDepCache.set(cacheKey, promise);
-    return promise;
+    // Dependency fetch failures are tolerated (empty deps), but aborts must propagate
+    return PersistentCache.getOrComputeRegistry(cacheKey, fetchAndCache).catch((err) => {
+        if (isAbortError(err)) throw err;
+        return [];
+    });
 }
 
 /**
@@ -237,7 +201,8 @@ export async function fetchModuleSize(name: string, version: string, signal?: Ab
             return parseInt(contentLength, 10);
         }
         return undefined;
-    } catch {
+    } catch (err) {
+        if (isAbortError(err)) throw err;
         return undefined;
     }
 }

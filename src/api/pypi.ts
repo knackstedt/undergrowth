@@ -1,28 +1,6 @@
 import { PersistentCache } from '../utils/cache';
 import { PermanentError, withRetry } from '../utils/retry';
 
-export interface PyPIPackageVersion {
-    name: string;
-    version: string;
-    summary: string;
-    description: string;
-    requires_python: string | null;
-    requires_dist: string[];
-    author: string;
-    author_email: string;
-    maintainer: string;
-    maintainer_email: string;
-    home_page: string;
-    project_urls: Record<string, string> | null;
-    package_url: string;
-    release_url: string;
-    files: Array<{
-        filename: string;
-        url: string;
-        size: number;
-    }>;
-}
-
 export interface PyPIPackageMeta {
     info: {
         name: string;
@@ -39,60 +17,47 @@ export interface PyPIPackageMeta {
         requires_python: string | null;
         license: string;
     };
+    /** Version → release files. Only the fields the graph needs are kept. */
     releases: Record<string, Array<{
-        filename: string;
-        url: string;
         size: number;
         upload_time: string;
     }>>;
-    urls: Array<{
-        filename: string;
-        url: string;
-        size: number;
-        upload_time: string;
-    }>;
 }
-
-// In-memory cache for in-flight requests (prevents duplicate concurrent fetches)
-const inFlightCache = new Map<string, Promise<PyPIPackageMeta>>();
 
 export async function fetchPackageMeta(name: string, signal?: AbortSignal): Promise<PyPIPackageMeta> {
     const cacheKey = `pypi:${name.toLowerCase()}`;
 
-    // Check in-memory cache for in-flight requests first
-    if (inFlightCache.has(cacheKey)) {
-        return inFlightCache.get(cacheKey)!;
-    }
-
-    // Use persistent cache with fallback to fetch
+    // getOrComputeRegistry dedupes concurrent fetches and caches results with TTL
     const fetchAndCache = async (): Promise<PyPIPackageMeta> => {
-        try {
-            return await withRetry(async () => {
-                const res = await fetch(`https://pypi.org/pypi/${encodeURIComponent(name)}/json`, { signal });
-                if (res.status >= 400 && res.status < 500) {
-                    throw new PermanentError(`Package "${name}" not found on PyPI (${res.status})`);
-                }
-                if (!res.ok) {
-                    throw new Error(`Failed to fetch package ${name}: ${res.statusText} (${res.status})`);
-                }
-                const data = await res.json() as PyPIPackageMeta;
+        return await withRetry(async () => {
+            const res = await fetch(`https://pypi.org/pypi/${encodeURIComponent(name)}/json`, { signal });
+            if (res.status >= 400 && res.status < 500) {
+                throw new PermanentError(`Package "${name}" not found on PyPI (${res.status})`);
+            }
+            if (!res.ok) {
+                throw new Error(`Failed to fetch package ${name}: ${res.statusText} (${res.status})`);
+            }
+            const raw = await res.json() as {
+                info: PyPIPackageMeta['info'];
+                releases?: Record<string, Array<{ size?: number; upload_time?: string }>>;
+            };
 
-                // Cache the result
-                await PersistentCache.setRegistry(cacheKey, data);
+            // Strip everything we don't use before it hits memory and IndexedDB.
+            // The raw response carries per-release file lists with digests/URLs
+            // and a top-level `urls` array that duplicate the latest release.
+            const releases: PyPIPackageMeta['releases'] = {};
+            for (const [version, files] of Object.entries(raw.releases || {})) {
+                releases[version] = (files || []).map(f => ({
+                    size: f.size || 0,
+                    upload_time: f.upload_time || ''
+                }));
+            }
 
-                return data;
-            }, 5, 2500, signal);
-        } catch (err) {
-            // Remove from in-flight cache on failure
-            inFlightCache.delete(cacheKey);
-            throw err;
-        }
+            return { info: raw.info, releases };
+        }, 5, 2500, signal);
     };
 
-    // Use persistent cache with TTL
-    const promise = PersistentCache.getOrComputeRegistry(cacheKey, fetchAndCache);
-    inFlightCache.set(cacheKey, promise);
-    return promise;
+    return PersistentCache.getOrComputeRegistry(cacheKey, fetchAndCache);
 }
 
 /**

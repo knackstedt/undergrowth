@@ -1,5 +1,5 @@
 import { PersistentCache } from '../utils/cache';
-import { PermanentError, withRetry } from '../utils/retry';
+import { isAbortError, PermanentError, withRetry } from '../utils/retry';
 
 export interface NuGetPackageVersion {
     version: string;
@@ -96,72 +96,49 @@ function getResourceUrl(serviceIndex: { resources: Array<{ '@type': string; '@id
     return resource?.['@id'] ?? null;
 }
 
-// In-memory cache for in-flight requests (prevents duplicate concurrent fetches)
-const inFlightCache = new Map<string, Promise<NuGetPackageMeta>>();
-
 export async function fetchPackageMeta(name: string, signal?: AbortSignal): Promise<NuGetPackageMeta> {
     const cacheKey = `nuget:${name.toLowerCase()}`;
 
-    // Check in-memory cache for in-flight requests first
-    if (inFlightCache.has(cacheKey)) {
-        return inFlightCache.get(cacheKey)!;
-    }
-
-    // Use persistent cache with fallback to fetch
+    // getOrComputeRegistry dedupes concurrent fetches and caches results with TTL
     const fetchAndCache = async (): Promise<NuGetPackageMeta> => {
-        try {
-            return await withRetry(async () => {
-                const serviceIndex = await getServiceIndex(signal);
-                const searchBaseUrl = getResourceUrl(serviceIndex, 'SearchQueryService');
+        return await withRetry(async () => {
+            const serviceIndex = await getServiceIndex(signal);
+            const searchBaseUrl = getResourceUrl(serviceIndex, 'SearchQueryService');
 
-                if (!searchBaseUrl) {
-                    throw new Error('NuGet SearchQueryService not available');
-                }
+            if (!searchBaseUrl) {
+                throw new Error('NuGet SearchQueryService not available');
+            }
 
-                // Search for the package
-                const searchUrl = `${searchBaseUrl}?q=packageid:${encodeURIComponent(name)}&take=1&prerelease=false&semVerLevel=2.0.0`;
-                const searchRes = await fetch(searchUrl, { signal });
+            // Search for the package
+            const searchUrl = `${searchBaseUrl}?q=packageid:${encodeURIComponent(name)}&take=1&prerelease=false&semVerLevel=2.0.0`;
+            const searchRes = await fetch(searchUrl, { signal });
 
-                if (!searchRes.ok) {
-                    throw new Error(`Failed to search NuGet package ${name}: ${searchRes.statusText}`);
-                }
+            if (!searchRes.ok) {
+                throw new Error(`Failed to search NuGet package ${name}: ${searchRes.statusText}`);
+            }
 
-                const searchData = await searchRes.json() as { data: NuGetPackageMeta[] };
+            const searchData = await searchRes.json() as { data: NuGetPackageMeta[] };
 
-                if (!searchData.data || searchData.data.length === 0) {
-                    throw new PermanentError(`Package "${name}" not found on NuGet`);
-                }
+            if (!searchData.data || searchData.data.length === 0) {
+                throw new PermanentError(`Package "${name}" not found on NuGet`);
+            }
 
-                const packageData = searchData.data[0];
+            const packageData = searchData.data[0];
 
-                // Normalize version data
-                if (packageData.versions) {
-                    packageData.versions = packageData.versions.map(v => ({
-                        ...v,
-                        version: normalizeVersion(v.version)
-                    }));
-                }
+            // Normalize version data
+            if (packageData.versions) {
+                packageData.versions = packageData.versions.map(v => ({
+                    ...v,
+                    version: normalizeVersion(v.version)
+                }));
+            }
 
-                // Cache the result
-                await PersistentCache.setRegistry(cacheKey, packageData);
-
-                return packageData;
-            }, 5, 2500, signal);
-        } catch (err) {
-            // Remove from in-flight cache on failure
-            inFlightCache.delete(cacheKey);
-            throw err;
-        }
+            return packageData;
+        }, 5, 2500, signal);
     };
 
-    // Use persistent cache with TTL
-    const promise = PersistentCache.getOrComputeRegistry(cacheKey, fetchAndCache);
-    inFlightCache.set(cacheKey, promise);
-    return promise;
+    return PersistentCache.getOrComputeRegistry(cacheKey, fetchAndCache);
 }
-
-// In-memory cache for in-flight dependency requests
-const inFlightDepCache = new Map<string, Promise<NuGetDependencyGroup[]>>();
 
 /**
  * Fetch dependencies for a specific version of a package.
@@ -174,12 +151,6 @@ export async function fetchVersionDependencies(
 ): Promise<NuGetDependencyGroup[]> {
     const cacheKey = `nuget:deps:${name.toLowerCase()}:${version}`;
 
-    // Check in-memory cache for in-flight requests first
-    if (inFlightDepCache.has(cacheKey)) {
-        return inFlightDepCache.get(cacheKey)!;
-    }
-
-    // Use persistent cache with fallback to fetch
     const fetchAndCache = async (): Promise<NuGetDependencyGroup[]> => {
         try {
             return await withRetry(async () => {
@@ -226,23 +197,20 @@ export async function fetchVersionDependencies(
                     }
                 }
 
-                // Cache the result
-                await PersistentCache.setRegistry(cacheKey, groups);
-
                 return groups;
             }, 5, 2500, signal);
         } catch (err) {
-            // Remove from in-flight cache on failure
-            inFlightDepCache.delete(cacheKey);
+            // Dependency fetch failures are tolerated (empty deps), but aborts must propagate
+            if (isAbortError(err)) throw err;
             console.warn(`[NuGet] Error fetching dependencies for ${name}@${version}:`, err);
             return [];
         }
     };
 
-    // Use persistent cache with TTL
-    const promise = PersistentCache.getOrComputeRegistry(cacheKey, fetchAndCache).catch(() => []);
-    inFlightDepCache.set(cacheKey, promise);
-    return promise;
+    return PersistentCache.getOrComputeRegistry(cacheKey, fetchAndCache).catch((err) => {
+        if (isAbortError(err)) throw err;
+        return [];
+    });
 }
 
 /**
