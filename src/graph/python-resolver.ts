@@ -1,7 +1,8 @@
 import { fetchPackageMeta, parseExtras, parseRequiresDist, resolvePythonVersion } from '../api/pypi';
-import type { DependencySource, ProgressCallback, ResolvedGraph } from './resolver';
+import type { DependencySource, ProgressCallback, ResolvedGraph, ResolverOptions } from './resolver';
 import { MICROPACKAGE_SIZE_THRESHOLD } from './resolver';
 import { enrichBulkWithDepsDevData } from '../utils/depsdev-enrichment';
+import { AbortedError } from '../utils/retry';
 
 export interface PythonRequirementsManifest {
     name: string;
@@ -13,6 +14,7 @@ export interface PythonRequirementsManifest {
 async function runBfsPythonResolution(
     graph: ResolvedGraph,
     queue: Array<{ name: string; versionDef: string; parentId: string | null; isPeer?: boolean; isExtra?: boolean; depth?: number }>,
+    options: ResolverOptions = {},
     onProgress?: ProgressCallback
 ): Promise<void> {
     const inProgress = new Set<string>();
@@ -29,10 +31,12 @@ async function runBfsPythonResolution(
     };
 
     const processQueue = async () => {
+        if (options.signal?.aborted) throw new AbortedError();
         const CONCURRENCY = 10;
         const batch = queue.splice(0, CONCURRENCY);
 
         await Promise.all(batch.map(async ({ name, versionDef, parentId, isPeer, isExtra, depth = 0 }) => {
+            if (options.signal?.aborted) throw new AbortedError();
             // Skip if we've reached max depth
             if (depth >= MAX_DEPTH) {
                 resolved++;
@@ -50,7 +54,7 @@ async function runBfsPythonResolution(
                     return;
                 }
 
-                const meta = await fetchPackageMeta(name);
+                const meta = await fetchPackageMeta(name, options.signal);
                 resolvedPackages.add(name.toLowerCase());
 
                 const versions = Object.keys(meta.releases || {});
@@ -158,8 +162,10 @@ async function runBfsPythonResolution(
                     queue.push({ name: depName, versionDef: depVersion, parentId: nodeId, depth: depth + 1 });
                 }
 
-                // Add extras as optional dependencies (similar to peer deps)
-                for (const extraDeps of Object.values(extras)) {
+                // Add extras as optional dependencies (similar to peer deps),
+                // only when the optional-deps toggle is on — otherwise they
+                // balloon the graph with every declared extra's subtree
+                for (const extraDeps of options.showPeerDeps ? Object.values(extras) : []) {
                     const extraDepEntries = Object.entries(extraDeps);
                     total += extraDepEntries.length;
                     for (const [depName, depVersion] of extraDepEntries) {
@@ -167,6 +173,7 @@ async function runBfsPythonResolution(
                     }
                 }
             } catch (err: unknown) {
+                if (err instanceof AbortedError || options.signal?.aborted) throw new AbortedError();
                 const message = err instanceof Error ? err.message : 'Unknown dependency resolution error';
                 graph.errors.push({ pkg: name, error: message });
 
@@ -208,6 +215,7 @@ async function runBfsPythonResolution(
 export async function resolvePythonDependencyTree(
     rootPkg: string,
     rootVersion?: string,
+    options?: ResolverOptions,
     onProgress?: ProgressCallback
 ): Promise<ResolvedGraph> {
     const graph: ResolvedGraph = {
@@ -218,7 +226,7 @@ export async function resolvePythonDependencyTree(
     };
 
     const queue = [{ name: rootPkg, versionDef: rootVersion || '*', parentId: null as string | null }];
-    await runBfsPythonResolution(graph, queue, onProgress);
+    await runBfsPythonResolution(graph, queue, options, onProgress);
 
     // Note: Cycle detection is done via the resolver's detectDependencyCycles
     // But since Python dependencies don't have as strong cycle guarantees,
@@ -228,6 +236,7 @@ export async function resolvePythonDependencyTree(
 
 export async function resolvePythonDependencyTreeFromManifest(
     manifest: PythonRequirementsManifest,
+    options?: ResolverOptions,
     onProgress?: ProgressCallback
 ): Promise<ResolvedGraph> {
     const graph: ResolvedGraph = {
@@ -257,7 +266,7 @@ export async function resolvePythonDependencyTreeFromManifest(
         versionDef,
         parentId: rootId }));
 
-    await runBfsPythonResolution(graph, queue, onProgress);
+    await runBfsPythonResolution(graph, queue, options, onProgress);
 
     return graph;
 }
@@ -266,7 +275,7 @@ export async function resolvePythonDependencyTreeFromManifest(
 /**
  * Enrich a resolved Python graph with metadata from deps.dev.
  */
-export async function enrichPythonGraphWithDepsDevData(graph: ResolvedGraph): Promise<void> {
+export async function enrichPythonGraphWithDepsDevData(graph: ResolvedGraph, signal?: AbortSignal): Promise<void> {
     const pypiNodes = new Map();
     
     for (const [nodeId, node] of graph.nodes.entries()) {
@@ -276,6 +285,6 @@ export async function enrichPythonGraphWithDepsDevData(graph: ResolvedGraph): Pr
     }
     
     if (pypiNodes.size > 0) {
-        await enrichBulkWithDepsDevData(pypiNodes, 'pypi');
+        await enrichBulkWithDepsDevData(pypiNodes, 'pypi', signal);
     }
 }

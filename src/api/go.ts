@@ -1,3 +1,4 @@
+import semver from 'semver';
 import { PersistentCache } from '../utils/cache';
 import { PermanentError, withRetry } from '../utils/retry';
 
@@ -59,10 +60,11 @@ interface GitHubSearchResult {
  * Uses the GitHub Search API which supports CORS, unlike pkg.go.dev.
  * Returns the full module path or null if no match found.
  */
-async function searchGoModule(shortName: string): Promise<string | null> {
+async function searchGoModule(shortName: string, signal?: AbortSignal): Promise<string | null> {
     try {
         const res = await fetch(
-            `https://api.github.com/search/repositories?q=${encodeURIComponent(shortName)}+language:go&sort=stars&order=desc&per_page=5`
+            `https://api.github.com/search/repositories?q=${encodeURIComponent(shortName)}+language:go&sort=stars&order=desc&per_page=5`,
+            { signal }
         );
         if (!res.ok) return null;
         const data = (await res.json()) as GitHubSearchResult;
@@ -80,7 +82,7 @@ async function searchGoModule(shortName: string): Promise<string | null> {
     }
 }
 
-export async function fetchPackageMeta(name: string): Promise<GoModuleMeta> {
+export async function fetchPackageMeta(name: string, signal?: AbortSignal): Promise<GoModuleMeta> {
     const cacheKey = `go:${name.toLowerCase()}`;
 
     // Check in-memory cache for in-flight requests first
@@ -95,7 +97,7 @@ export async function fetchPackageMeta(name: string): Promise<GoModuleMeta> {
         // If the name doesn't look like a full Go module path (no dot = no domain),
         // try searching pkg.go.dev for the full path
         if (!name.includes('.')) {
-            const found = await searchGoModule(name);
+            const found = await searchGoModule(name, signal);
             if (found) {
                 resolvedName = found;
             } else {
@@ -110,7 +112,7 @@ export async function fetchPackageMeta(name: string): Promise<GoModuleMeta> {
                 const encodedPath = encodeModulePath(resolvedName);
 
                 // Fetch the list of versions
-                const listRes = await fetch(`${GOPROXY_BASE}/${encodedPath}/@v/list`);
+                const listRes = await fetch(`${GOPROXY_BASE}/${encodedPath}/@v/list`, { signal });
                 if (listRes.status >= 400 && listRes.status < 500) {
                     throw new PermanentError(`Module "${resolvedName}" not found (${listRes.status})`);
                 }
@@ -125,11 +127,21 @@ export async function fetchPackageMeta(name: string): Promise<GoModuleMeta> {
                     throw new Error(`No versions found for module ${resolvedName}`);
                 }
 
+                // @v/list is not guaranteed to be sorted — order by semver
+                versions.sort((a, b) => {
+                    const va = semver.valid(a) ? a : semver.coerce(a)?.version;
+                    const vb = semver.valid(b) ? b : semver.coerce(b)?.version;
+                    if (va && vb) return semver.compare(va, vb);
+                    if (va) return -1;
+                    if (vb) return 1;
+                    return a.localeCompare(b);
+                });
+
                 // Get the latest version
                 const latestVersion = versions[versions.length - 1];
 
                 // Fetch the go.mod file for the latest version to get dependencies
-                const modRes = await fetch(`${GOPROXY_BASE}/${encodedPath}/@v/${latestVersion}.mod`);
+                const modRes = await fetch(`${GOPROXY_BASE}/${encodedPath}/@v/${latestVersion}.mod`, { signal });
                 let dependencies: GoModDependency[] = [];
 
                 if (modRes.ok) {
@@ -149,7 +161,7 @@ export async function fetchPackageMeta(name: string): Promise<GoModuleMeta> {
                 await PersistentCache.setRegistry(cacheKey, result);
 
                 return result;
-            });
+            }, 5, 2500, signal);
         } catch (err) {
             // Remove from in-flight cache on failure
             inFlightCache.delete(cacheKey);
@@ -171,7 +183,8 @@ const inFlightDepCache = new Map<string, Promise<GoModDependency[]>>();
  */
 export async function fetchVersionDependencies(
     name: string,
-    version: string
+    version: string,
+    signal?: AbortSignal
 ): Promise<GoModDependency[]> {
     const cacheKey = `go:deps:${name.toLowerCase()}:${version}`;
 
@@ -185,7 +198,7 @@ export async function fetchVersionDependencies(
         try {
             return await withRetry(async () => {
                 const encodedPath = encodeModulePath(name);
-                const res = await fetch(`${GOPROXY_BASE}/${encodedPath}/@v/${version}.mod`);
+                const res = await fetch(`${GOPROXY_BASE}/${encodedPath}/@v/${version}.mod`, { signal });
                 if (!res.ok) {
                     throw new Error(`Failed to fetch go.mod: ${res.statusText} (${res.status})`);
                 }
@@ -196,7 +209,7 @@ export async function fetchVersionDependencies(
                 await PersistentCache.setRegistry(cacheKey, deps);
 
                 return deps;
-            });
+            }, 5, 2500, signal);
         } catch (err) {
             // Remove from in-flight cache on failure
             inFlightDepCache.delete(cacheKey);
@@ -214,10 +227,10 @@ export async function fetchVersionDependencies(
  * Fetch the zipped module size (in bytes) from proxy.golang.org via HEAD request.
  * Returns undefined if the size cannot be determined.
  */
-export async function fetchModuleSize(name: string, version: string): Promise<number | undefined> {
+export async function fetchModuleSize(name: string, version: string, signal?: AbortSignal): Promise<number | undefined> {
     try {
         const encodedPath = encodeModulePath(name);
-        const res = await fetch(`${GOPROXY_BASE}/${encodedPath}/@v/${version}.zip`, { method: 'HEAD' });
+        const res = await fetch(`${GOPROXY_BASE}/${encodedPath}/@v/${version}.zip`, { method: 'HEAD', signal });
         if (!res.ok) return undefined;
         const contentLength = res.headers.get('content-length');
         if (contentLength) {
@@ -318,65 +331,41 @@ export function resolveGoVersion(
     requirement: string,
     availableVersions: string[]
 ): string {
-    // Remove 'v' prefix if present for comparison
-    const cleanReq = requirement.startsWith('v') ? requirement.slice(1) : requirement;
-    
-    // Direct version match
+    if (!requirement || requirement === 'latest') {
+        return availableVersions[availableVersions.length - 1];
+    }
+
+    // Direct version match — go.mod requires exact versions
     if (availableVersions.includes(requirement)) {
         return requirement;
     }
-    
-    // Try without v prefix
+
+    // Try adding/removing the 'v' prefix
+    const cleanReq = requirement.startsWith('v') ? requirement.slice(1) : requirement;
     const versionWithV = 'v' + cleanReq;
     if (availableVersions.includes(versionWithV)) {
         return versionWithV;
     }
-    
-    // For Go modules, find the highest version that satisfies >= requirement
-    // Go uses Minimum Version Selection - we'll approximate with latest matching
-    
-    // Clean available versions for comparison
-    const cleanVersions = availableVersions.map(v => ({
-        original: v,
-        clean: v.startsWith('v') ? v.slice(1) : v
-    }));
-    
-    // Try to find a version that matches the requirement
-    // Handle pseudo-versions by extracting timestamp
-    if (cleanReq.includes('-')) {
-        // Pseudo-version: v0.0.0-20240101120000-abcdef123456
-        // Find the latest version
-        return availableVersions[availableVersions.length - 1];
+
+    // Pseudo-version (v0.0.0-20240101120000-abcdef123456) or commit SHA —
+    // can't be resolved against the version list; keep it as-is so the node
+    // reflects what go.mod actually pins
+    if (cleanReq.includes('-') || /^[0-9a-f]{7,}$/i.test(cleanReq)) {
+        return requirement;
     }
-    
-    // For exact version requirement, try to find compatible higher version
-    // Go allows ^ prefix in some contexts, but typically uses exact or latest
-    if (cleanReq.match(/^\d/)) {
-        const reqParts = cleanReq.split('.').map(Number);
-        
-        for (let i = cleanVersions.length - 1; i >= 0; i--) {
-            const { original, clean } = cleanVersions[i];
-            const availParts = clean.split('.').map(Number);
-            
-            // Check if available version is >= required
-            let isCompatible = true;
-            for (let j = 0; j < Math.max(reqParts.length, availParts.length); j++) {
-                const reqPart = reqParts[j] || 0;
-                const availPart = availParts[j] || 0;
-                
-                if (availPart > reqPart) break;
-                if (availPart < reqPart) {
-                    isCompatible = false;
-                    break;
-                }
-            }
-            
-            if (isCompatible) {
-                return original;
+
+    // The required version isn't in the proxy list (retracted/unknown).
+    // Approximate MVS: pick the lowest available version >= the requirement.
+    const reqSem = semver.coerce(cleanReq);
+    if (reqSem) {
+        for (const v of availableVersions) {
+            const vSem = semver.valid(v) ? v : semver.coerce(v)?.version;
+            if (vSem && semver.gte(vSem, reqSem)) {
+                return v;
             }
         }
     }
-    
+
     // Default to latest
     return availableVersions[availableVersions.length - 1];
 }

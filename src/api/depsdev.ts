@@ -57,7 +57,7 @@ function systemToString(system: PackageSystem): string {
     return system.toLowerCase();
 }
 
-export async function fetchPackage(system: PackageSystem, name: string): Promise<DepsDevPackage> {
+export async function fetchPackage(system: PackageSystem, name: string, signal?: AbortSignal): Promise<DepsDevPackage> {
     const cacheKey = `depsdev:package:${system}:${name}`;
 
     if (inFlightCache.has(cacheKey)) {
@@ -70,8 +70,8 @@ export async function fetchPackage(system: PackageSystem, name: string): Promise
                 const encodedName = encodePackageName(name);
                 const systemStr = systemToString(system);
                 const url = `https://api.deps.dev/v3/systems/${systemStr}/packages/${encodedName}`;
-                
-                const res = await fetch(url);
+
+                const res = await fetch(url, { signal });
                 
                 if (res.status >= 400 && res.status < 500) {
                     throw new PermanentError(`Package "${name}" not found in deps.dev (${res.status})`);
@@ -82,11 +82,11 @@ export async function fetchPackage(system: PackageSystem, name: string): Promise
                 }
                 
                 const data = await res.json() as DepsDevPackage;
-                
+
                 await PersistentCache.setRegistry(cacheKey, data);
-                
+
                 return data;
-            });
+            }, 5, 2500, signal);
         } catch (err) {
             inFlightCache.delete(cacheKey);
             throw err;
@@ -101,7 +101,8 @@ export async function fetchPackage(system: PackageSystem, name: string): Promise
 export async function fetchVersionInfo(
     system: PackageSystem,
     name: string,
-    version: string
+    version: string,
+    signal?: AbortSignal
 ): Promise<DepsDevVersionInfo> {
     const cacheKey = `depsdev:version:${system}:${name}:${version}`;
 
@@ -116,8 +117,8 @@ export async function fetchVersionInfo(
                 const encodedVersion = encodeURIComponent(version);
                 const systemStr = systemToString(system);
                 const url = `https://api.deps.dev/v3/systems/${systemStr}/packages/${encodedName}/versions/${encodedVersion}`;
-                
-                const res = await fetch(url);
+
+                const res = await fetch(url, { signal });
                 
                 if (res.status >= 400 && res.status < 500) {
                     throw new PermanentError(`Version "${version}" of package "${name}" not found in deps.dev (${res.status})`);
@@ -128,11 +129,11 @@ export async function fetchVersionInfo(
                 }
                 
                 const data = await res.json() as DepsDevVersionInfo;
-                
+
                 await PersistentCache.setRegistry(cacheKey, data);
-                
+
                 return data;
-            });
+            }, 5, 2500, signal);
         } catch (err) {
             inFlightCache.delete(cacheKey);
             throw err;

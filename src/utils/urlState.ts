@@ -57,21 +57,22 @@ export function buildPackageIdentifier(name: string, version?: string): string {
  * Pack filter toggles into a compressed byte array
  * Bits are packed as:
  * - bit 0: maxDependencies.enabled
- * - bit 1-5: maxDependencies.value (0-31, clamped)
+ * - bit 1-5: maxDependencies.value, low 5 bits
  * - bit 6: singleMaintainer
- * - bit 7: (unused, was smallSize)
- * - bit 8: (unused)
+ * - bit 7-8: maxDependencies.value, high 2 bits (extends range to 0-127;
+ *   previously unused, so older URLs still decode correctly)
  * - bit 9: prerelease
- * - bit 10: typedOnly
- * - bit 11: esmOnly
+ * - bit 10: esmOnly
+ * - bit 11: (unused — was a duplicate cjsOnly write, never read)
  * - bit 12: cjsOnly
  * - bit 13: showPeerDeps
  * - bit 14: noRecentUpdates.enabled
- * - bit 15-19: noRecentUpdates.months (0-31 months, scaled from actual)
+ * - bit 15-19: noRecentUpdates.months (0-31 months)
  * - bit 20: hasAvailableUpdates
  * - bit 21: unstableVersion
  * - bit 22: suspiciousVersion
- * - bit 23: nonOsiLicense.enabled
+ * - bit 23: nonOsiLicense.enabled (the license list itself travels in the
+ *   `nl` query param — it's variable-length and can't be bit-packed)
  * - bit 24: staleTopLevel
  */
 export function encodeFilters(filters: WarningToggles, showPeerDeps = false): string {
@@ -80,15 +81,15 @@ export function encodeFilters(filters: WarningToggles, showPeerDeps = false): st
     // Pack maxDependencies.enabled (1 bit)
     if (filters.maxDependencies.enabled) packed |= 1 << 0;
 
-    // Pack maxDependencies.value (5 bits, clamped 0-31)
-    const maxDepsValue = Math.min(31, Math.max(0, filters.maxDependencies.value));
-    packed |= maxDepsValue << 1;
+    // Pack maxDependencies.value (7 bits split around bit 6, clamped 0-127)
+    const maxDepsValue = Math.min(127, Math.max(0, filters.maxDependencies.value));
+    packed |= (maxDepsValue & 0x1F) << 1;
+    packed |= ((maxDepsValue >> 5) & 0x3) << 7;
 
     // Pack remaining booleans
     if (filters.singleMaintainer) packed |= 1 << 6;
     if (filters.prerelease) packed |= 1 << 9;
     if (filters.esmOnly) packed |= 1 << 10;
-    if (filters.cjsOnly) packed |= 1 << 11;
     if (filters.cjsOnly) packed |= 1 << 12;
     if (showPeerDeps) packed |= 1 << 13;
 
@@ -123,7 +124,7 @@ export function decodeFilters(encoded: string): DecodedFilters | null {
             filters: {
                 maxDependencies: {
                     enabled: !!(packed & (1 << 0)),
-                    value: (packed >> 1) & 0x1F, // 5 bits
+                    value: ((packed >> 1) & 0x1F) | (((packed >> 7) & 0x3) << 5), // 7 bits split around bit 6
                 },
                 singleMaintainer: !!(packed & (1 << 6)),
                 prerelease: !!(packed & (1 << 9)),
@@ -180,6 +181,23 @@ export function decodeViewport(encoded: string): ViewportState | null {
 }
 
 /**
+ * The nonOsiLicense license list is variable-length, so it travels in its own
+ * `nl` query param alongside the bit-packed `f` param.
+ */
+function applyNonOsiLicensesParam(decoded: DecodedFilters | null, params: URLSearchParams): void {
+    const nl = params.get('nl');
+    if (decoded && nl) {
+        decoded.filters.nonOsiLicense.licenses = nl;
+    }
+}
+
+function setNonOsiLicensesParam(params: URLSearchParams, filters?: WarningToggles): void {
+    if (filters?.nonOsiLicense?.enabled && filters.nonOsiLicense.licenses) {
+        params.set('nl', filters.nonOsiLicense.licenses);
+    }
+}
+
+/**
  * Parse URL path and query params into state
  */
 export function parseURLState(): Partial<URLState> | null {
@@ -198,6 +216,7 @@ export function parseURLState(): Partial<URLState> | null {
             // Parse filters
             const filtersEncoded = params.get('f');
             const decoded = filtersEncoded ? decodeFilters(filtersEncoded) : null;
+            applyNonOsiLicensesParam(decoded, params);
 
             const mpt = params.get('mpt');
             return {
@@ -221,6 +240,7 @@ export function parseURLState(): Partial<URLState> | null {
             // Parse filters
             const filtersEncoded = params.get('f');
             const decoded = filtersEncoded ? decodeFilters(filtersEncoded) : null;
+            applyNonOsiLicensesParam(decoded, params);
 
             // Parse viewport
             const viewportEncoded = params.get('v');
@@ -252,6 +272,7 @@ export function parseURLState(): Partial<URLState> | null {
     // Parse filters
     const filtersEncoded = params.get('f');
     const decoded = filtersEncoded ? decodeFilters(filtersEncoded) : null;
+    applyNonOsiLicensesParam(decoded, params);
 
     // Parse viewport
     const viewportEncoded = params.get('v');
@@ -331,6 +352,7 @@ export function buildURL(
 
         if (filters) {
             params.set('f', encodeFilters(filters, showPeerDeps));
+            setNonOsiLicensesParam(params, filters);
         }
         if (micropackageThreshold !== undefined && micropackageThreshold !== 6144) {
             params.set('mpt', String(Math.round(micropackageThreshold / 1024)));
@@ -347,6 +369,7 @@ export function buildURL(
 
         if (filters) {
             params.set('f', encodeFilters(filters, showPeerDeps));
+            setNonOsiLicensesParam(params, filters);
         }
         if (micropackageThreshold !== undefined && micropackageThreshold !== 6144) {
             params.set('mpt', String(Math.round(micropackageThreshold / 1024)));
@@ -367,6 +390,7 @@ export function buildURL(
 
     if (filters) {
         params.set('f', encodeFilters(filters, showPeerDeps));
+        setNonOsiLicensesParam(params, filters);
     }
     if (micropackageThreshold !== undefined && micropackageThreshold !== 6144) {
         params.set('mpt', String(Math.round(micropackageThreshold / 1024)));

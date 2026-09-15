@@ -74,25 +74,32 @@ export function detectManifestUrl(input: string): { type: 'npm' | 'pypi' | 'crat
 /**
  * Fetch and parse a manifest file from a URL.
  */
-export async function fetchManifestFromUrl(url: string, type: 'npm' | 'pypi' | 'crates' | 'go' | 'nuget'): Promise<FetchedManifest> {
-    const response = await fetch(url);
+export async function fetchManifestFromUrl(url: string, type: 'npm' | 'pypi' | 'crates' | 'go' | 'nuget', signal?: AbortSignal): Promise<FetchedManifest> {
+    const response = await fetch(url, { signal });
     if (!response.ok) {
         throw new Error(`Failed to fetch manifest: ${response.statusText} (${response.status})`);
     }
 
     const text = await response.text();
+    return parseManifestContent(text, type, url);
+}
 
+/**
+ * Parse manifest file contents. `sourceLabel` is only used to derive a display
+ * name for the synthetic root node — it can be a URL or a plain filename.
+ */
+export function parseManifestContent(content: string, type: 'npm' | 'pypi' | 'crates' | 'go' | 'nuget', sourceLabel: string): FetchedManifest {
     switch (type) {
         case 'npm':
-            return parsePackageJson(text);
+            return parsePackageJson(content);
         case 'pypi':
-            return parseRequirementsTxtManifest(text, url);
+            return parseRequirementsTxtManifest(content, sourceLabel);
         case 'crates':
-            return parseCargoToml(text);
+            return parseCargoToml(content);
         case 'go':
-            return parseGoModManifest(text, url);
+            return parseGoModManifest(content, sourceLabel);
         case 'nuget':
-            return parseCsprojManifest(text, url);
+            return parseCsprojManifest(content, sourceLabel);
         default:
             return null;
     }
@@ -142,7 +149,7 @@ function parsePackageJson(content: string): FetchedManifest {
     }
 }
 
-function parseRequirementsTxtManifest(content: string, url: string): FetchedManifest {
+function parseRequirementsTxtManifest(content: string, sourceLabel: string): FetchedManifest {
     const deps = parseRequirementsTxt(content);
 
     const pypiDeps = deps.filter(d => d.source === 'pypi');
@@ -151,17 +158,15 @@ function parseRequirementsTxtManifest(content: string, url: string): FetchedMani
         throw new Error('requirements.txt has no dependencies to graph');
     }
 
-    // Extract a name from the URL
-    const urlObj = new URL(url);
-    const pathname = urlObj.pathname;
-    const filename = pathname.split('/').pop() || 'requirements';
+    // Extract a name from the source label (URL path or filename)
+    const filename = sourceLabel.split('/').pop() || 'requirements';
 
     return {
         type: 'pypi',
         data: {
             name: filename.replace('.txt', ''),
             version: 'remote',
-            description: `Python requirements from ${url}`,
+            description: `Python requirements from ${sourceLabel}`,
             dependencies: Object.fromEntries(pypiDeps.map(d => [d.name, d.specifier || '*']))
         }
     };
@@ -247,7 +252,7 @@ function parseCargoToml(content: string): FetchedManifest {
     };
 }
 
-function parseGoModManifest(content: string, url: string): FetchedManifest {
+function parseGoModManifest(content: string, sourceLabel: string): FetchedManifest {
     const deps = parseGoMod(content);
 
     // Filter out stdlib packages and indirect deps (those will be resolved if showPeerDeps is on)
@@ -257,11 +262,9 @@ function parseGoModManifest(content: string, url: string): FetchedManifest {
         throw new Error('go.mod has no direct dependencies to graph');
     }
 
-    // Extract a name from the URL
-    const urlObj = new URL(url);
-    const pathname = urlObj.pathname;
-    const filename = pathname.split('/').pop() || 'go.mod';
-    const folderName = pathname.split('/').slice(-2, -1)[0] || 'module';
+    // Extract a name from the source label (URL path or filename)
+    const filename = sourceLabel.split('/').pop() || 'go.mod';
+    const folderName = sourceLabel.split('/').slice(-2, -1)[0] || 'module';
 
     // Try to get module name from the go.mod content
     const moduleMatch = content.match(/^module\s+(\S+)/m);
@@ -278,7 +281,7 @@ function parseGoModManifest(content: string, url: string): FetchedManifest {
     };
 }
 
-function parseCsprojManifest(content: string, url: string): FetchedManifest {
+function parseCsprojManifest(content: string, sourceLabel: string): FetchedManifest {
     const dependencies: Record<string, string> = {};
 
     // Parse PackageReference elements from XML
@@ -305,10 +308,8 @@ function parseCsprojManifest(content: string, url: string): FetchedManifest {
         throw new Error('.csproj has no PackageReference dependencies to graph');
     }
 
-    // Extract name from URL
-    const urlObj = new URL(url);
-    const pathname = urlObj.pathname;
-    const filename = pathname.split('/').pop() || 'project.csproj';
+    // Extract name from the source label (URL path or filename)
+    const filename = sourceLabel.split('/').pop() || 'project.csproj';
     const projectName = filename.replace('.csproj', '');
 
     // Try to get target framework

@@ -9,23 +9,42 @@ export class PermanentError extends Error {
 }
 
 /**
+ * Thrown when the caller aborts the operation. Propagates without retrying.
+ */
+export class AbortedError extends Error {
+    constructor() {
+        super('Aborted');
+        this.name = 'AbortedError';
+    }
+}
+
+export function isAbortError(err: unknown): boolean {
+    return err instanceof AbortedError
+        || (err instanceof DOMException && err.name === 'AbortError')
+        || (err instanceof Error && err.message === 'Aborted');
+}
+
+/**
  * Retries a function with exponential backoff on transient errors.
- * Throws immediately (without retrying) if a PermanentError is thrown.
+ * Throws immediately (without retrying) if a PermanentError is thrown or the
+ * provided AbortSignal fires.
  */
 export async function withRetry<T>(
     fn: () => Promise<T>,
     maxRetries: number = 5,
-    initialDelay: number = 2500
+    initialDelay: number = 2500,
+    signal?: AbortSignal
 ): Promise<T> {
     let lastError: unknown;
 
     for (let i = 0; i < maxRetries; i++) {
+        if (signal?.aborted) throw new AbortedError();
         try {
             return await fn();
         } catch (err: unknown) {
-            // Don't retry permanent failures (e.g. 404 Not Found)
-            if (err instanceof PermanentError) {
-                throw err;
+            // Don't retry permanent failures (e.g. 404 Not Found) or aborts
+            if (err instanceof PermanentError || isAbortError(err) || signal?.aborted) {
+                throw isAbortError(err) || signal?.aborted ? new AbortedError() : err;
             }
 
             lastError = err;
@@ -35,7 +54,17 @@ export async function withRetry<T>(
                 const delay = initialDelay * Math.pow(2, i);
                 const errorMsg = err instanceof Error ? err.message : String(err);
                 console.warn(`Attempt ${i + 1} failed: ${errorMsg}. Retrying in ${delay}ms...`);
-                await new Promise(resolve => setTimeout(resolve, delay));
+                await new Promise<void>((resolve, reject) => {
+                    const timer = setTimeout(() => {
+                        signal?.removeEventListener('abort', onAbort);
+                        resolve();
+                    }, delay);
+                    const onAbort = () => {
+                        clearTimeout(timer);
+                        reject(new AbortedError());
+                    };
+                    signal?.addEventListener('abort', onAbort, { once: true });
+                });
             }
         }
     }

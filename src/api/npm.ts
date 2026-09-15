@@ -67,7 +67,7 @@ export interface NpmPackageMeta {
 // In-memory cache for in-flight requests (prevents duplicate concurrent fetches)
 const inFlightCache = new Map<string, Promise<NpmPackageMeta>>();
 
-export async function fetchPackageMeta(name: string): Promise<NpmPackageMeta> {
+export async function fetchPackageMeta(name: string, signal?: AbortSignal): Promise<NpmPackageMeta> {
     const cacheKey = `npm:${name}`;
 
     // Check in-memory cache for in-flight requests first
@@ -86,7 +86,7 @@ export async function fetchPackageMeta(name: string): Promise<NpmPackageMeta> {
                 const encodedName = name.startsWith('@')
                     ? `@${name.slice(1).replace(/\//g, '%2F')}`
                     : encodeURIComponent(name);
-                const res = await fetch(`https://registry.npmjs.org/${encodedName}`);
+                const res = await fetch(`https://registry.npmjs.org/${encodedName}`, { signal });
                 if (res.status >= 400 && res.status < 500) {
                     // 4xx errors are permanent — don't retry them
                     throw new PermanentError(`Package "${name}" not found (${res.status})`);
@@ -153,7 +153,7 @@ export async function fetchPackageMeta(name: string): Promise<NpmPackageMeta> {
                 await PersistentCache.setRegistry(cacheKey, data);
 
                 return data;
-            });
+            }, 5, 2500, signal);
         } catch (err) {
             // Remove from in-flight cache on failure
             inFlightCache.delete(cacheKey);
@@ -167,19 +167,19 @@ export async function fetchPackageMeta(name: string): Promise<NpmPackageMeta> {
     return promise;
 }
 
-export async function getDownloads(name: string): Promise<number | null> {
+export async function getDownloads(name: string, signal?: AbortSignal): Promise<number | null> {
     try {
         const data = await withRetry(async () => {
             // Scoped packages need special encoding: @scope/name -> @scope%2Fname
             const encodedName = name.startsWith('@')
                 ? `@${name.slice(1).replace(/\//g, '%2F')}`
                 : encodeURIComponent(name);
-            const res = await fetch(`https://api.npmjs.org/downloads/point/last-week/${encodedName}`);
+            const res = await fetch(`https://api.npmjs.org/downloads/point/last-week/${encodedName}`, { signal });
             if (!res.ok) {
                 throw new Error(`Failed to fetch downloads: ${res.statusText} (${res.status})`);
             }
             return res.json();
-        });
+        }, 5, 2500, signal);
         return data.downloads || 0;
     } catch (e) {
         console.error('Failed to fetch downloads', e);

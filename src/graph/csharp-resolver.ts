@@ -1,6 +1,7 @@
 import { fetchPackageMeta, fetchVersionDependencies, getBestDependencyGroup, resolveNuGetVersion } from '../api/nuget';
-import type { DependencySource, ProgressCallback, ResolvedGraph } from './resolver';
+import type { DependencySource, ProgressCallback, ResolvedGraph, ResolverOptions } from './resolver';
 import { enrichBulkWithDepsDevData } from '../utils/depsdev-enrichment';
+import { AbortedError } from '../utils/retry';
 
 export interface CsprojManifest {
     name: string;
@@ -14,6 +15,7 @@ async function runBfsCSharpResolution(
     graph: ResolvedGraph,
     queue: Array<{ name: string; versionDef: string; parentId: string | null; isPeer?: boolean; depth?: number }>,
     targetFramework?: string,
+    options: ResolverOptions = {},
     onProgress?: ProgressCallback
 ): Promise<void> {
     const inProgress = new Set<string>();
@@ -27,10 +29,12 @@ async function runBfsCSharpResolution(
     };
 
     const processQueue = async () => {
+        if (options.signal?.aborted) throw new AbortedError();
         const CONCURRENCY = 10;
         const batch = queue.splice(0, CONCURRENCY);
 
         await Promise.all(batch.map(async ({ name, versionDef, parentId, isPeer, depth = 0 }) => {
+            if (options.signal?.aborted) throw new AbortedError();
             if (depth >= MAX_DEPTH) {
                 resolved++;
                 onProgress?.(resolved, total);
@@ -46,7 +50,7 @@ async function runBfsCSharpResolution(
                     return;
                 }
 
-                const meta = await fetchPackageMeta(name);
+                const meta = await fetchPackageMeta(name, options.signal);
                 resolvedPackages.add(name.toLowerCase());
 
                 const versions = meta.versions.map(v => v.version);
@@ -77,10 +81,8 @@ async function runBfsCSharpResolution(
                 const uploadTime = versionData?.published || '';
 
                 // Fetch dependencies for this specific version (not included in search API)
-                const dependencyGroups = await fetchVersionDependencies(name, resolvedVersion);
-                console.log(`[C#] Fetched ${dependencyGroups.length} dependency groups for ${name}@${resolvedVersion}`);
+                const dependencyGroups = await fetchVersionDependencies(name, resolvedVersion, options.signal);
                 const bestGroup = getBestDependencyGroup(dependencyGroups, targetFramework);
-                console.log(`[C#] Selected dependency group for targetFramework=${targetFramework}:`, bestGroup?.targetFramework || 'none', 'with', bestGroup?.dependencies?.length || 0, 'deps');
                 const dependencies: Record<string, string> = {};
 
                 if (bestGroup) {
@@ -114,6 +116,7 @@ async function runBfsCSharpResolution(
                     queue.push({ name: depName, versionDef: depVersion, parentId: nodeId, depth: depth + 1 });
                 }
             } catch (err: unknown) {
+                if (err instanceof AbortedError || options.signal?.aborted) throw new AbortedError();
                 const message = err instanceof Error ? err.message : 'Unknown dependency resolution error';
                 graph.errors.push({ pkg: name, error: message });
 
@@ -154,6 +157,7 @@ export async function resolveCSharpDependencyTree(
     rootPkg: string,
     rootVersion?: string,
     targetFramework?: string,
+    options?: ResolverOptions,
     onProgress?: ProgressCallback
 ): Promise<ResolvedGraph> {
     const graph: ResolvedGraph = {
@@ -164,13 +168,14 @@ export async function resolveCSharpDependencyTree(
     };
 
     const queue = [{ name: rootPkg, versionDef: rootVersion || '*', parentId: null as string | null }];
-    await runBfsCSharpResolution(graph, queue, targetFramework, onProgress);
+    await runBfsCSharpResolution(graph, queue, targetFramework, options, onProgress);
 
     return graph;
 }
 
 export async function resolveCSharpDependencyTreeFromManifest(
     manifest: CsprojManifest,
+    options?: ResolverOptions,
     onProgress?: ProgressCallback
 ): Promise<ResolvedGraph> {
     const graph: ResolvedGraph = {
@@ -199,7 +204,7 @@ export async function resolveCSharpDependencyTreeFromManifest(
         versionDef,
         parentId: rootId }));
 
-    await runBfsCSharpResolution(graph, queue, manifest.targetFramework, onProgress);
+    await runBfsCSharpResolution(graph, queue, manifest.targetFramework, options, onProgress);
 
     return graph;
 }
@@ -208,7 +213,7 @@ export async function resolveCSharpDependencyTreeFromManifest(
 /**
  * Enrich a resolved C# graph with metadata from deps.dev.
  */
-export async function enrichCSharpGraphWithDepsDevData(graph: ResolvedGraph): Promise<void> {
+export async function enrichCSharpGraphWithDepsDevData(graph: ResolvedGraph, signal?: AbortSignal): Promise<void> {
     const nugetNodes = new Map();
     
     for (const [nodeId, node] of graph.nodes.entries()) {
@@ -218,6 +223,6 @@ export async function enrichCSharpGraphWithDepsDevData(graph: ResolvedGraph): Pr
     }
     
     if (nugetNodes.size > 0) {
-        await enrichBulkWithDepsDevData(nugetNodes, 'nuget');
+        await enrichBulkWithDepsDevData(nugetNodes, 'nuget', signal);
     }
 }

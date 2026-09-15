@@ -1,8 +1,9 @@
 import type { GoModDependency } from '../api/go';
 import { fetchPackageMeta, fetchVersionDependencies, fetchModuleSize, resolveGoVersion } from '../api/go';
-import type { DependencySource, ProgressCallback, ResolvedGraph } from './resolver';
+import type { DependencySource, ProgressCallback, ResolvedGraph, ResolverOptions } from './resolver';
 import { MICROPACKAGE_SIZE_THRESHOLD } from './resolver';
 import { enrichBulkWithDepsDevData } from '../utils/depsdev-enrichment';
+import { AbortedError } from '../utils/retry';
 
 export interface GoModManifest {
     name: string;
@@ -22,7 +23,7 @@ interface QueueItem {
 async function runBfsGoResolution(
     graph: ResolvedGraph,
     queue: QueueItem[],
-    options: { showPeerDeps?: boolean } = {},
+    options: ResolverOptions = {},
     onProgress?: ProgressCallback
 ): Promise<void> {
     // Track resolved packages: name -> Set of resolved versions (to avoid duplicate nodes for same version)
@@ -50,42 +51,21 @@ async function runBfsGoResolution(
     };
 
     const isStdlibPackage = (name: string): boolean => {
-        // Common stdlib packages - these shouldn't be resolved through the proxy
-        const stdlibPrefixes = [
-            'archive/', 'bufio', 'bytes', 'compress/', 'container/', 'context', 'crypto/',
-            'database/', 'debug/', 'embed', 'encoding/', 'errors', 'expvar', 'flag',
-            'fmt', 'go/', 'hash/', 'html/', 'image/', 'index/', 'io/', 'log/',
-            'math/', 'mime', 'net/', 'os/', 'path/', 'plugin', 'reflect', 'regexp/',
-            'runtime/', 'sort', 'strconv', 'strings', 'sync/', 'syscall', 'testing/',
-            'text/', 'time', 'unicode/', 'unsafe'
-        ];
-        // Direct stdlib packages
-        const stdlibDirect = [
-            'bufio', 'bytes', 'context', 'crypto', 'encoding', 'errors', 'fmt', 'hash',
-            'image', 'io', 'log', 'math', 'mime', 'net', 'os', 'path', 'reflect',
-            'regexp', 'runtime', 'sort', 'strconv', 'strings', 'sync', 'testing',
-            'text', 'time', 'unicode', 'unsafe'
-        ];
-        // Internal/golang packages that don't resolve via proxy
-        const internalPrefixes = [
-            'golang.org/x/',
-            'internal/',
-            'google.golang.org/',
-            'cloud.google.com/',
-            'k8s.io/kubernetes',
-            'sigs.k8s.io/'
-        ];
-        
-        if (stdlibDirect.includes(name)) return true;
-        if (stdlibPrefixes.some(prefix => name.startsWith(prefix))) return true;
-        return internalPrefixes.some(prefix => name.startsWith(prefix));
+        // Module paths always have a domain (a dot) in the first path segment;
+        // stdlib packages never do. This covers the entire stdlib without a
+        // hand-maintained list, and never blocks real modules like
+        // golang.org/x/* or cloud.google.com/*.
+        const firstSegment = name.split('/')[0];
+        return !firstSegment.includes('.');
     };
 
     const processQueue = async () => {
+        if (options.signal?.aborted) throw new AbortedError();
         const CONCURRENCY = 10;
         const batch = queue.splice(0, CONCURRENCY);
 
         await Promise.all(batch.map(async ({ name, versionDef, parentId, depth, isOptional }) => {
+            if (options.signal?.aborted) throw new AbortedError();
             // Skip stdlib packages - they don't need resolution
             if (isStdlibPackage(name)) {
                 resolved++;
@@ -108,7 +88,7 @@ async function runBfsGoResolution(
             }
 
             try {
-                const meta = await fetchPackageMeta(name);
+                const meta = await fetchPackageMeta(name, options.signal);
                 const resolvedName = meta.name;
 
                 // Get available versions (already sorted)
@@ -173,7 +153,7 @@ async function runBfsGoResolution(
                 }
 
                 // Fetch dependencies for this specific version
-                const rawDependencies: GoModDependency[] = await fetchVersionDependencies(resolvedName, resolvedVersion);
+                const rawDependencies: GoModDependency[] = await fetchVersionDependencies(resolvedName, resolvedVersion, options.signal);
 
                 // Parse dependencies - only direct (non-indirect) dependencies
                 const dependencies: Record<string, string> = {};
@@ -194,7 +174,7 @@ async function runBfsGoResolution(
                 }
 
                 // Fetch size asynchronously
-                const size = await fetchModuleSize(resolvedName, resolvedVersion);
+                const size = await fetchModuleSize(resolvedName, resolvedVersion, options.signal);
 
                 const hasSizeData = size !== undefined && size > 0;
                 const isMicropackage = hasSizeData && size < MICROPACKAGE_SIZE_THRESHOLD;
@@ -237,6 +217,7 @@ async function runBfsGoResolution(
                     }
                 }
             } catch (err: unknown) {
+                if (err instanceof AbortedError || options.signal?.aborted) throw new AbortedError();
                 const message = err instanceof Error ? err.message : 'Unknown dependency resolution error';
                 graph.errors.push({ pkg: name, error: message });
 
@@ -281,7 +262,7 @@ async function runBfsGoResolution(
 export async function resolveGoDependencyTree(
     rootPkg: string,
     rootVersion?: string,
-    options?: { showPeerDeps?: boolean },
+    options?: ResolverOptions,
     onProgress?: ProgressCallback
 ): Promise<ResolvedGraph> {
     const graph: ResolvedGraph = {
@@ -299,7 +280,7 @@ export async function resolveGoDependencyTree(
 
 export async function resolveGoDependencyTreeFromManifest(
     manifest: GoModManifest,
-    options?: { showPeerDeps?: boolean },
+    options?: ResolverOptions,
     onProgress?: ProgressCallback
 ): Promise<ResolvedGraph> {
     const graph: ResolvedGraph = {
@@ -339,7 +320,7 @@ export async function resolveGoDependencyTreeFromManifest(
 /**
  * Enrich a resolved Go graph with metadata from deps.dev.
  */
-export async function enrichGoGraphWithDepsDevData(graph: ResolvedGraph): Promise<void> {
+export async function enrichGoGraphWithDepsDevData(graph: ResolvedGraph, signal?: AbortSignal): Promise<void> {
     const goNodes = new Map();
     
     for (const [nodeId, node] of graph.nodes.entries()) {
@@ -349,6 +330,6 @@ export async function enrichGoGraphWithDepsDevData(graph: ResolvedGraph): Promis
     }
     
     if (goNodes.size > 0) {
-        await enrichBulkWithDepsDevData(goNodes, 'go');
+        await enrichBulkWithDepsDevData(goNodes, 'go', signal);
     }
 }

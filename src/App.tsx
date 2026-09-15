@@ -20,8 +20,8 @@ import {resolvePythonDependencyTreeFromManifest} from './graph/python-resolver';
 import type { GraphNodeData } from './graph/resolver';
 import {enrichGraphWithDepsDevData, resolveDependencyTree} from './graph/resolver';
 import { buildTimelineFromVersions, type TimelineVersion } from './graph/timeline';
-import { detectManifestUrl, fetchManifestFromUrl } from './utils/fetchManifest';
-import { PermanentError } from './utils/retry';
+import { detectManifestUrl, fetchManifestFromUrl, parseManifestContent } from './utils/fetchManifest';
+import { isAbortError, PermanentError } from './utils/retry';
 
 type NodeRelationship = 'selected' | 'upstream' | 'downstream' | 'dedicated' | 'both' | 'dimmed';
 type AppGraphNode = Node<Record<string, unknown> & GraphNodeData & { relationship?: NodeRelationship; searchMatch?: boolean; }>;
@@ -75,6 +75,7 @@ function App() {
   const [searchRegistry, setSearchRegistry] = useState<'npm' | 'pypi' | 'crates' | 'go' | 'nuget'>('npm');
   const [manifestUrl, setManifestUrl] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const comparisonAbortRef = useRef<Partial<Record<'left' | 'right', AbortController>>>({});
   const viewportContext = useContext(ViewportContext);
   const [copied, setCopied] = useState(false);
 
@@ -109,6 +110,12 @@ function App() {
     side: 'left' | 'right',
     setSideData: React.Dispatch<React.SetStateAction<ComparisonSide>>
   ) => {
+    // Cancel any in-flight resolution for this side
+    comparisonAbortRef.current[side]?.abort();
+    const abortController = new AbortController();
+    comparisonAbortRef.current[side] = abortController;
+    const signal = abortController.signal;
+
     setSideData(prev => ({
       ...prev,
       isLoading: true,
@@ -127,106 +134,63 @@ function App() {
 
       if (spec.type === 'file' && spec.fileContent) {
         // Handle file-based specs
-        if (registry === 'npm') {
-          const pkg = JSON.parse(spec.fileContent);
-          const { resolveDependencyTreeFromManifest } = await import('./graph/resolver');
-          tree = await resolveDependencyTreeFromManifest(pkg, { showPeerDeps }, onProgress);
-        } else if (registry === 'pypi') {
-          const {resolvePythonDependencyTreeFromManifest, enrichPythonGraphWithDepsDevData} = await import('./graph/python-resolver');
-          const deps = parseRequirementsTxt(spec.fileContent);
-          const manifest = {
-            name: spec.name || 'requirements',
-            version: 'local',
-            description: `Python requirements`,
-            dependencies: Object.fromEntries(deps.filter(d => d.source === 'pypi').map(d => [d.name, d.specifier || '*']))
-          };
-          tree = await resolvePythonDependencyTreeFromManifest(manifest, onProgress);
-          setSideData(prev => ({ ...prev, loadingLabel: 'Enriching with deps.dev metadata…' }));
-          await enrichPythonGraphWithDepsDevData(tree);
-        } else if (registry === 'go') {
-          const {resolveGoDependencyTreeFromManifest, enrichGoGraphWithDepsDevData} = await import('./graph/go-resolver');
-          const deps = parseGoMod(spec.fileContent);
-          const directDeps = deps.filter(d => !d.indirect);
-          const manifest = {
-            name: spec.name || 'go-module',
-            version: 'local',
-            description: `Go module`,
-            dependencies: Object.fromEntries(directDeps.map(d => [d.path, d.version]))
-          };
-          tree = await resolveGoDependencyTreeFromManifest(manifest, { showPeerDeps }, onProgress);
-          setSideData(prev => ({ ...prev, loadingLabel: 'Enriching with deps.dev metadata…' }));
-          await enrichGoGraphWithDepsDevData(tree);
-        } else if (registry === 'crates') {
-          const {resolveRustDependencyTreeFromManifest, enrichRustGraphWithDepsDevData} = await import('./graph/rust-resolver');
-          // Parse Cargo.toml - simplified
-          const nameMatch = spec.fileContent.match(/name\s*=\s*"([^"]+)"/);
-          const versionMatch = spec.fileContent.match(/version\s*=\s*"([^"]+)"/);
-          const depsMatch = spec.fileContent.match(/\[dependencies\]([^[]*)/);
-          const deps: Record<string, string> = {};
-          if (depsMatch) {
-            const depLines = depsMatch[1].trim().split('\n');
-            for (const line of depLines) {
-              const match = line.match(/(\S+)\s*=\s*"([^"]+)"/);
-              if (match) deps[match[1]] = match[2];
-            }
-          }
-          const manifest = {
-            name: nameMatch?.[1] || spec.name || 'rust-package',
-            version: versionMatch?.[1] || 'local',
-            dependencies: deps
-          };
-          tree = await resolveRustDependencyTreeFromManifest(manifest, { showPeerDeps }, onProgress);
-          setSideData(prev => ({ ...prev, loadingLabel: 'Enriching with deps.dev metadata…' }));
-          await enrichRustGraphWithDepsDevData(tree);
-        } else if (registry === 'nuget') {
-          const {resolveCSharpDependencyTreeFromManifest, enrichCSharpGraphWithDepsDevData} = await import('./graph/csharp-resolver');
-          const parser = new DOMParser();
-          const doc = parser.parseFromString(spec.fileContent, 'application/xml');
-          const packageId = doc.querySelector('PackageId')?.textContent || spec.name || 'csharp-package';
-          const version = doc.querySelector('Version')?.textContent || 'local';
-          const packageRefs = Array.from(doc.querySelectorAll('PackageReference'));
-          const deps: Record<string, string> = {};
-          for (const ref of packageRefs) {
-            const include = ref.getAttribute('Include');
-            const versionAttr = ref.getAttribute('Version') || ref.querySelector('Version')?.textContent;
-            if (include && versionAttr) deps[include] = versionAttr;
-          }
-          const manifest = { name: packageId, version, dependencies: deps };
-          tree = await resolveCSharpDependencyTreeFromManifest(manifest, onProgress);
-          setSideData(prev => ({ ...prev, loadingLabel: 'Enriching with deps.dev metadata…' }));
-          await enrichCSharpGraphWithDepsDevData(tree);
-        } else {
+        const manifest = parseManifestContent(spec.fileContent, registry, spec.name || 'manifest');
+        if (!manifest) {
           throw new Error(`Unsupported registry: ${registry}`);
+        }
+        if (manifest.type === 'npm') {
+          const { resolveDependencyTreeFromManifest } = await import('./graph/resolver');
+          tree = await resolveDependencyTreeFromManifest(manifest.data, { showPeerDeps, signal }, onProgress);
+        } else if (manifest.type === 'pypi') {
+          const {resolvePythonDependencyTreeFromManifest, enrichPythonGraphWithDepsDevData} = await import('./graph/python-resolver');
+          tree = await resolvePythonDependencyTreeFromManifest(manifest.data, { showPeerDeps, signal }, onProgress);
+          setSideData(prev => ({ ...prev, loadingLabel: 'Enriching with deps.dev metadata…' }));
+          await enrichPythonGraphWithDepsDevData(tree, signal);
+        } else if (manifest.type === 'go') {
+          const {resolveGoDependencyTreeFromManifest, enrichGoGraphWithDepsDevData} = await import('./graph/go-resolver');
+          tree = await resolveGoDependencyTreeFromManifest(manifest.data, { showPeerDeps, signal }, onProgress);
+          setSideData(prev => ({ ...prev, loadingLabel: 'Enriching with deps.dev metadata…' }));
+          await enrichGoGraphWithDepsDevData(tree, signal);
+        } else if (manifest.type === 'crates') {
+          const {resolveRustDependencyTreeFromManifest, enrichRustGraphWithDepsDevData} = await import('./graph/rust-resolver');
+          tree = await resolveRustDependencyTreeFromManifest(manifest.data, { showPeerDeps, signal }, onProgress);
+          setSideData(prev => ({ ...prev, loadingLabel: 'Enriching with deps.dev metadata…' }));
+          await enrichRustGraphWithDepsDevData(tree, signal);
+        } else if (manifest.type === 'nuget') {
+          const {resolveCSharpDependencyTreeFromManifest, enrichCSharpGraphWithDepsDevData} = await import('./graph/csharp-resolver');
+          tree = await resolveCSharpDependencyTreeFromManifest(manifest.data, { signal }, onProgress);
+          setSideData(prev => ({ ...prev, loadingLabel: 'Enriching with deps.dev metadata…' }));
+          await enrichCSharpGraphWithDepsDevData(tree, signal);
         }
       } else if (spec.name) {
         // Handle package specs
         const version = spec.version;
         if (registry === 'pypi') {
           const {resolvePythonDependencyTree, enrichPythonGraphWithDepsDevData} = await import('./graph/python-resolver');
-          tree = await resolvePythonDependencyTree(spec.name, version || '*', onProgress);
+          tree = await resolvePythonDependencyTree(spec.name, version || '*', { showPeerDeps, signal }, onProgress);
           setSideData(prev => ({ ...prev, loadingLabel: 'Enriching with deps.dev metadata…' }));
-          await enrichPythonGraphWithDepsDevData(tree);
+          await enrichPythonGraphWithDepsDevData(tree, signal);
         } else if (registry === 'crates') {
           const {resolveRustDependencyTree, enrichRustGraphWithDepsDevData} = await import('./graph/rust-resolver');
-          tree = await resolveRustDependencyTree(spec.name, version || '*', { showPeerDeps }, onProgress);
+          tree = await resolveRustDependencyTree(spec.name, version || '*', { showPeerDeps, signal }, onProgress);
           setSideData(prev => ({ ...prev, loadingLabel: 'Enriching with deps.dev metadata…' }));
-          await enrichRustGraphWithDepsDevData(tree);
+          await enrichRustGraphWithDepsDevData(tree, signal);
         } else if (registry === 'go') {
           const {resolveGoDependencyTree, enrichGoGraphWithDepsDevData} = await import('./graph/go-resolver');
-          tree = await resolveGoDependencyTree(spec.name, version || 'latest', { showPeerDeps }, onProgress);
+          tree = await resolveGoDependencyTree(spec.name, version || 'latest', { showPeerDeps, signal }, onProgress);
           setSideData(prev => ({ ...prev, loadingLabel: 'Enriching with deps.dev metadata…' }));
-          await enrichGoGraphWithDepsDevData(tree);
+          await enrichGoGraphWithDepsDevData(tree, signal);
         } else if (registry === 'nuget') {
           const {resolveCSharpDependencyTree, enrichCSharpGraphWithDepsDevData} = await import('./graph/csharp-resolver');
-          tree = await resolveCSharpDependencyTree(spec.name, version || '*', undefined, onProgress);
+          tree = await resolveCSharpDependencyTree(spec.name, version || '*', undefined, { signal }, onProgress);
           setSideData(prev => ({ ...prev, loadingLabel: 'Enriching with deps.dev metadata…' }));
-          await enrichCSharpGraphWithDepsDevData(tree);
+          await enrichCSharpGraphWithDepsDevData(tree, signal);
         } else {
           // NPM
           const {resolveDependencyTree, enrichGraphWithDepsDevData} = await import('./graph/resolver');
-          tree = await resolveDependencyTree(spec.name, version, { showPeerDeps }, onProgress);
+          tree = await resolveDependencyTree(spec.name, version, { showPeerDeps, signal }, onProgress);
           setSideData(prev => ({ ...prev, loadingLabel: 'Enriching with deps.dev metadata…' }));
-          await enrichGraphWithDepsDevData(tree);
+          await enrichGraphWithDepsDevData(tree, signal);
         }
       } else {
         throw new Error('Invalid spec: no name or file content');
@@ -234,14 +198,7 @@ function App() {
 
       setSideData(prev => ({ ...prev, loadingLabel: 'Computing layout…' }));
 
-      // DEBUG: Check tree node IDs before layout
-      const treeIds = [...tree.nodes.keys()].slice(0, 5);
-      console.log(`[generateComparisonGraph] side=${side}, tree node IDs BEFORE layout:`, treeIds);
-
       const layout = await layoutGraph(tree);
-
-      // DEBUG: Log generated node IDs
-      console.log(`[generateComparisonGraph] side=${side}, generated ${layout.nodes.length} nodes. Sample IDs:`, layout.nodes.slice(0, 5).map((n: AppGraphNode) => n.id));
 
       setSideData({
         title: spec.name || 'Unknown',
@@ -260,7 +217,7 @@ function App() {
         setFitViewSignalRight(s => s + 1);
       }
     } catch (err: unknown) {
-      if (err instanceof Error && err.message === 'Aborted') {
+      if (isAbortError(err)) {
         return;
       }
       const message = err instanceof Error ? err.message : 'Failed to generate graph';
@@ -489,19 +446,22 @@ function App() {
     setLoadingLabel(`Resolving ${identifier}...`);
     setProgress({ resolved: 0, total: 1 });
 
+    const signal = abortController.signal;
+
     try {
       const onProgress = makeProgressCallback(`Resolving ${identifier}`);
-      
+
       if (registry === 'pypi') {
         // Use Python resolver
         const { resolvePythonDependencyTree } = await import('./graph/python-resolver');
-        const tree = await resolvePythonDependencyTree(identifier, version || '*', onProgress);
+        const usePeerDeps = overrideShowPeerDeps ?? showPeerDeps;
+        const tree = await resolvePythonDependencyTree(identifier, version || '*', { showPeerDeps: usePeerDeps, signal }, onProgress);
         if (tree.errors.length > 0) {
           console.warn('Dependency resolution had errors:', tree.errors);
         }
         setLoadingLabel('Enriching with deps.dev metadata…');
         const { enrichPythonGraphWithDepsDevData } = await import('./graph/python-resolver');
-        await enrichPythonGraphWithDepsDevData(tree);
+        await enrichPythonGraphWithDepsDevData(tree, signal);
         setLoadingLabel('Computing layout…');
         const layout = await layoutGraph(tree);
         setGraphData(layout);
@@ -511,12 +471,12 @@ function App() {
         // Use Rust resolver
         const {resolveRustDependencyTree, enrichRustGraphWithDepsDevData} = await import('./graph/rust-resolver');
         const usePeerDeps = overrideShowPeerDeps ?? showPeerDeps;
-        const tree = await resolveRustDependencyTree(identifier, version || '*', { showPeerDeps: usePeerDeps }, onProgress);
+        const tree = await resolveRustDependencyTree(identifier, version || '*', { showPeerDeps: usePeerDeps, signal }, onProgress);
         if (tree.errors.length > 0) {
           console.warn('Dependency resolution had errors:', tree.errors);
         }
         setLoadingLabel('Enriching with deps.dev metadata…');
-        await enrichRustGraphWithDepsDevData(tree);
+        await enrichRustGraphWithDepsDevData(tree, signal);
         setLoadingLabel('Computing layout…');
         const layout = await layoutGraph(tree);
         setGraphData(layout);
@@ -526,14 +486,14 @@ function App() {
         // Use Go resolver
         const {resolveGoDependencyTree, enrichGoGraphWithDepsDevData} = await import('./graph/go-resolver');
         const usePeerDeps = overrideShowPeerDeps ?? showPeerDeps;
-        const tree = await resolveGoDependencyTree(identifier, version || 'latest', { showPeerDeps: usePeerDeps }, onProgress);
+        const tree = await resolveGoDependencyTree(identifier, version || 'latest', { showPeerDeps: usePeerDeps, signal }, onProgress);
         // Filter out "no versions found" errors - these are expected for stdlib and private packages
         const significantErrors = tree.errors.filter(e => !e.error.includes('no versions found'));
         if (significantErrors.length > 0) {
           console.warn('Dependency resolution had errors:', significantErrors);
         }
         setLoadingLabel('Enriching with deps.dev metadata…');
-        await enrichGoGraphWithDepsDevData(tree);
+        await enrichGoGraphWithDepsDevData(tree, signal);
         setLoadingLabel('Computing layout…');
         const layout = await layoutGraph(tree);
         setGraphData(layout);
@@ -542,12 +502,12 @@ function App() {
       } else if (registry === 'nuget') {
         // Use C# / NuGet resolver
         const {resolveCSharpDependencyTree, enrichCSharpGraphWithDepsDevData} = await import('./graph/csharp-resolver');
-        const tree = await resolveCSharpDependencyTree(identifier, version || '*', undefined, onProgress);
+        const tree = await resolveCSharpDependencyTree(identifier, version || '*', undefined, { signal }, onProgress);
         if (tree.errors.length > 0) {
           console.warn('Dependency resolution had errors:', tree.errors);
         }
         setLoadingLabel('Enriching with deps.dev metadata…');
-        await enrichCSharpGraphWithDepsDevData(tree);
+        await enrichCSharpGraphWithDepsDevData(tree, signal);
         setLoadingLabel('Computing layout…');
         const layout = await layoutGraph(tree);
         setGraphData(layout);
@@ -556,7 +516,7 @@ function App() {
       } else {
         // Use NPM resolver
         const usePeerDeps = overrideShowPeerDeps ?? showPeerDeps;
-        const tree = await resolveDependencyTree(identifier, version, { showPeerDeps: usePeerDeps }, onProgress);
+        const tree = await resolveDependencyTree(identifier, version, { showPeerDeps: usePeerDeps, signal }, onProgress);
         if (tree.errors.length > 0) {
           console.warn('Dependency resolution had errors:', tree.errors);
         }
@@ -565,7 +525,7 @@ function App() {
           setWarningLine(`Detected ${tree.cycles.length} dependency cycle${tree.cycles.length === 1 ? '' : 's'}.`);
         }
         setLoadingLabel('Enriching with deps.dev metadata…');
-        await enrichGraphWithDepsDevData(tree);
+        await enrichGraphWithDepsDevData(tree, signal);
         setLoadingLabel('Computing layout…');
         const layout = await layoutGraph(tree);
         setGraphData(layout);
@@ -573,8 +533,7 @@ function App() {
         setSelectedNode(null);
       }
     } catch (err: unknown) {
-      if (err instanceof Error && err.message === 'Aborted') {
-        console.log('Search aborted:', identifier);
+      if (isAbortError(err)) {
         return;
       }
       if (err instanceof PermanentError) {
@@ -585,7 +544,11 @@ function App() {
       const message = err instanceof Error ? err.message : 'Failed to generate graph. Check console.';
       setErrorLine(message);
     } finally {
-      setIsLoading(false);
+      // Only clear loading if this search is still the current one — a
+      // superseded search must not hide the newer one's progress
+      if (abortControllerRef.current === abortController) {
+        setIsLoading(false);
+      }
     }
   };
 
@@ -648,18 +611,18 @@ function App() {
     setProgress({ resolved: 0, total: 1 });
     setManifestUrl(url);
 
+    // Cancel previous search if any — do this before fetching so a stale
+    // manifest download can't outlive a newer request
+    abortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+    const signal = abortController.signal;
+
     try {
-      const manifest = await fetchManifestFromUrl(url, type);
+      const manifest = await fetchManifestFromUrl(url, type, signal);
       if (!manifest) {
         throw new Error('Failed to parse manifest');
       }
-
-      // Cancel previous search if any
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-      }
-      const abortController = new AbortController();
-      abortControllerRef.current = abortController;
 
       const onProgress = makeProgressCallback(`Resolving ${manifest.data.name}`);
 
@@ -678,7 +641,7 @@ function App() {
           dependencies: manifest.data.dependencies,
           devDependencies: manifest.data.devDependencies,
           peerDependencies: manifest.data.peerDependencies
-        }, { showPeerDeps }, onProgress);
+        }, { showPeerDeps, signal }, onProgress);
 
         if (tree.errors.length > 0) {
           console.warn('Dependency resolution had errors:', tree.errors);
@@ -687,7 +650,7 @@ function App() {
           setWarningLine(`Detected ${tree.cycles.length} dependency cycle${tree.cycles.length === 1 ? '' : 's'}.`);
         }
         setLoadingLabel('Enriching with deps.dev metadata…');
-        await enrichGraphWithDepsDevData(tree);
+        await enrichGraphWithDepsDevData(tree, signal);
         setLoadingLabel('Computing layout…');
         const layout = await layoutGraph(tree);
         setGraphData(layout);
@@ -698,7 +661,7 @@ function App() {
         setLastSearchedInput(manifest.data.name);
         setLastSearchedVersion(undefined);
 
-        const tree = await resolvePythonDependencyTreeFromManifest(manifest.data, onProgress);
+        const tree = await resolvePythonDependencyTreeFromManifest(manifest.data, { showPeerDeps, signal }, onProgress);
         if (tree.errors.length > 0) {
           console.warn('Dependency resolution had errors:', tree.errors);
         }
@@ -713,7 +676,7 @@ function App() {
         setLastSearchedVersion(manifest.data.version);
 
         const {resolveRustDependencyTreeFromManifest} = await import('./graph/rust-resolver');
-        const tree = await resolveRustDependencyTreeFromManifest(manifest.data, { showPeerDeps }, onProgress);
+        const tree = await resolveRustDependencyTreeFromManifest(manifest.data, { showPeerDeps, signal }, onProgress);
         if (tree.errors.length > 0) {
           console.warn('Dependency resolution had errors:', tree.errors);
         }
@@ -728,7 +691,7 @@ function App() {
         setLastSearchedVersion(manifest.data.version);
 
         const {resolveCSharpDependencyTreeFromManifest} = await import('./graph/csharp-resolver');
-        const tree = await resolveCSharpDependencyTreeFromManifest(manifest.data, onProgress);
+        const tree = await resolveCSharpDependencyTreeFromManifest(manifest.data, { signal }, onProgress);
         if (tree.errors.length > 0) {
           console.warn('Dependency resolution had errors:', tree.errors);
         }
@@ -740,14 +703,15 @@ function App() {
 
       setFitViewSignal(s => s + 1);
     } catch (err: unknown) {
-      if (err instanceof Error && err.message === 'Aborted') {
-        console.log('Manifest fetch aborted');
+      if (isAbortError(err)) {
         return;
       }
       const message = err instanceof Error ? err.message : 'Failed to fetch or parse manifest.';
       setErrorLine(message);
     } finally {
-      setIsLoading(false);
+      if (abortControllerRef.current === abortController) {
+        setIsLoading(false);
+      }
     }
   };
 
@@ -825,6 +789,12 @@ function App() {
         window.history.replaceState(null, '', '#');
       }
 
+      // Cancel any in-flight resolution before starting a new one
+      abortControllerRef.current?.abort();
+      const abortController = new AbortController();
+      abortControllerRef.current = abortController;
+      const signal = abortController.signal;
+
       const file = e.dataTransfer?.files?.[0];
       if (file && file.name === 'package.json') {
         try {
@@ -850,10 +820,8 @@ function App() {
           setWarningLine(null);
           const onProgress = makeProgressCallback(`Resolving ${identifier}`);
           try {
-            // For package.json drops, still use the old resolver for now
-            // TODO: Update to use streaming resolver for local manifests too
             const { resolveDependencyTreeFromManifest } = await import('./graph/resolver');
-            const tree = await resolveDependencyTreeFromManifest(pkg, { showPeerDeps }, onProgress);
+            const tree = await resolveDependencyTreeFromManifest(pkg, { showPeerDeps, signal }, onProgress);
             if (tree.errors.length > 0) {
               console.warn('Dependency resolution had errors:', tree.errors);
             }
@@ -861,7 +829,7 @@ function App() {
               setWarningLine(`Detected ${tree.cycles.length} dependency cycle${tree.cycles.length === 1 ? '' : 's'}.`);
             }
             setLoadingLabel('Enriching with deps.dev metadata…');
-            await enrichGraphWithDepsDevData(tree);
+            await enrichGraphWithDepsDevData(tree, signal);
             setLoadingLabel('Computing layout…');
             const layout = await layoutGraph(tree);
             setGraphData(layout);
@@ -870,10 +838,14 @@ function App() {
             // Clear URL so refresh doesn't reload
             window.history.replaceState(null, '', '#');
           } catch (err: unknown) {
-            const message = err instanceof Error ? err.message : 'Failed to generate graph.';
-            setErrorLine(message);
+            if (!isAbortError(err)) {
+              const message = err instanceof Error ? err.message : 'Failed to generate graph.';
+              setErrorLine(message);
+            }
           } finally {
-            setIsLoading(false);
+            if (abortControllerRef.current === abortController) {
+              setIsLoading(false);
+            }
           }
         } catch {
           setErrorLine('Failed to parse package.json.');
@@ -907,10 +879,13 @@ function App() {
 
           const onProgress = makeProgressCallback(`Resolving Python deps`);
           try {
-            const tree = await resolvePythonDependencyTreeFromManifest(manifest, onProgress);
+            const tree = await resolvePythonDependencyTreeFromManifest(manifest, { showPeerDeps, signal }, onProgress);
             if (tree.errors.length > 0) {
               console.warn('Dependency resolution had errors:', tree.errors);
             }
+            setLoadingLabel('Enriching with deps.dev metadata…');
+            const { enrichPythonGraphWithDepsDevData } = await import('./graph/python-resolver');
+            await enrichPythonGraphWithDepsDevData(tree, signal);
             setLoadingLabel('Computing layout…');
             const layout = await layoutGraph(tree);
             setGraphData(layout);
@@ -919,10 +894,14 @@ function App() {
             // Clear URL so refresh doesn't reload
             window.history.replaceState(null, '', '#');
           } catch (err: unknown) {
-            const message = err instanceof Error ? err.message : 'Failed to generate graph.';
-            setErrorLine(message);
+            if (!isAbortError(err)) {
+              const message = err instanceof Error ? err.message : 'Failed to generate graph.';
+              setErrorLine(message);
+            }
           } finally {
-            setIsLoading(false);
+            if (abortControllerRef.current === abortController) {
+              setIsLoading(false);
+            }
           }
         } catch {
           setErrorLine('Failed to parse requirements.txt.');
@@ -962,8 +941,65 @@ function App() {
 
           const onProgress = makeProgressCallback(`Resolving Go deps`);
           try {
-            const { resolveGoDependencyTreeFromManifest } = await import('./graph/go-resolver');
-            const tree = await resolveGoDependencyTreeFromManifest(manifest, { showPeerDeps }, onProgress);
+            const { resolveGoDependencyTreeFromManifest, enrichGoGraphWithDepsDevData } = await import('./graph/go-resolver');
+            const tree = await resolveGoDependencyTreeFromManifest(manifest, { showPeerDeps, signal }, onProgress);
+            if (tree.errors.length > 0) {
+              console.warn('Dependency resolution had errors:', tree.errors);
+            }
+            setLoadingLabel('Enriching with deps.dev metadata…');
+            await enrichGoGraphWithDepsDevData(tree, signal);
+            setLoadingLabel('Computing layout…');
+            const layout = await layoutGraph(tree);
+            setGraphData(layout);
+            setSelectedNode(null);
+            setFitViewSignal(s => s + 1);
+            // Clear URL so refresh doesn't reload
+            window.history.replaceState(null, '', '#');
+          } catch (err: unknown) {
+            if (!isAbortError(err)) {
+              const message = err instanceof Error ? err.message : 'Failed to generate graph.';
+              setErrorLine(message);
+            }
+          } finally {
+            if (abortControllerRef.current === abortController) {
+              setIsLoading(false);
+            }
+          }
+        } catch {
+          setErrorLine('Failed to parse go.mod.');
+          setWarningLine(null);
+        }
+      } else if (file && (file.name === 'Cargo.toml' || file.name.endsWith('.csproj'))) {
+        try {
+          const text = await file.text();
+          const type = file.name.endsWith('.csproj') ? 'nuget' : 'crates';
+          const manifest = parseManifestContent(text, type, file.name);
+          if (!manifest || manifest.type !== type) {
+            throw new Error('Failed to parse manifest');
+          }
+
+          setLastSearchedRegistry(type);
+          setSearchInput(manifest.data.name);
+          setLastSearchedInput(manifest.data.name);
+          setLastSearchedVersion(manifest.data.version);
+          setIsLoading(true);
+          setErrorLine(null);
+          setWarningLine(null);
+
+          const onProgress = makeProgressCallback(`Resolving ${manifest.data.name}`);
+          try {
+            let tree;
+            if (manifest.type === 'crates') {
+              const { resolveRustDependencyTreeFromManifest, enrichRustGraphWithDepsDevData } = await import('./graph/rust-resolver');
+              tree = await resolveRustDependencyTreeFromManifest(manifest.data, { showPeerDeps, signal }, onProgress);
+              setLoadingLabel('Enriching with deps.dev metadata…');
+              await enrichRustGraphWithDepsDevData(tree, signal);
+            } else {
+              const { resolveCSharpDependencyTreeFromManifest, enrichCSharpGraphWithDepsDevData } = await import('./graph/csharp-resolver');
+              tree = await resolveCSharpDependencyTreeFromManifest(manifest.data, { signal }, onProgress);
+              setLoadingLabel('Enriching with deps.dev metadata…');
+              await enrichCSharpGraphWithDepsDevData(tree, signal);
+            }
             if (tree.errors.length > 0) {
               console.warn('Dependency resolution had errors:', tree.errors);
             }
@@ -975,17 +1011,21 @@ function App() {
             // Clear URL so refresh doesn't reload
             window.history.replaceState(null, '', '#');
           } catch (err: unknown) {
-            const message = err instanceof Error ? err.message : 'Failed to generate graph.';
-            setErrorLine(message);
+            if (!isAbortError(err)) {
+              const message = err instanceof Error ? err.message : 'Failed to generate graph.';
+              setErrorLine(message);
+            }
           } finally {
-            setIsLoading(false);
+            if (abortControllerRef.current === abortController) {
+              setIsLoading(false);
+            }
           }
         } catch {
-          setErrorLine('Failed to parse go.mod.');
+          setErrorLine(`Failed to parse ${file.name}.`);
           setWarningLine(null);
         }
       } else if (file) {
-        setErrorLine('Please drop a valid package.json, requirements.txt, Cargo.toml, or go.mod file.');
+        setErrorLine('Please drop a valid package.json, requirements.txt, Cargo.toml, go.mod, or .csproj file.');
         setWarningLine(null);
       }
     };

@@ -1,4 +1,5 @@
 import { PersistentCache } from '../utils/cache';
+import { PermanentError, withRetry } from '../utils/retry';
 
 export interface PyPIPackageVersion {
     name: string;
@@ -55,7 +56,7 @@ export interface PyPIPackageMeta {
 // In-memory cache for in-flight requests (prevents duplicate concurrent fetches)
 const inFlightCache = new Map<string, Promise<PyPIPackageMeta>>();
 
-export async function fetchPackageMeta(name: string): Promise<PyPIPackageMeta> {
+export async function fetchPackageMeta(name: string, signal?: AbortSignal): Promise<PyPIPackageMeta> {
     const cacheKey = `pypi:${name.toLowerCase()}`;
 
     // Check in-memory cache for in-flight requests first
@@ -66,19 +67,21 @@ export async function fetchPackageMeta(name: string): Promise<PyPIPackageMeta> {
     // Use persistent cache with fallback to fetch
     const fetchAndCache = async (): Promise<PyPIPackageMeta> => {
         try {
-            const res = await fetch(`https://pypi.org/pypi/${encodeURIComponent(name)}/json`);
-            if (res.status === 404) {
-                throw new Error(`Package "${name}" not found on PyPI`);
-            }
-            if (!res.ok) {
-                throw new Error(`Failed to fetch package ${name}: ${res.statusText} (${res.status})`);
-            }
-            const data = await res.json() as PyPIPackageMeta;
+            return await withRetry(async () => {
+                const res = await fetch(`https://pypi.org/pypi/${encodeURIComponent(name)}/json`, { signal });
+                if (res.status >= 400 && res.status < 500) {
+                    throw new PermanentError(`Package "${name}" not found on PyPI (${res.status})`);
+                }
+                if (!res.ok) {
+                    throw new Error(`Failed to fetch package ${name}: ${res.statusText} (${res.status})`);
+                }
+                const data = await res.json() as PyPIPackageMeta;
 
-            // Cache the result
-            await PersistentCache.setRegistry(cacheKey, data);
+                // Cache the result
+                await PersistentCache.setRegistry(cacheKey, data);
 
-            return data;
+                return data;
+            }, 5, 2500, signal);
         } catch (err) {
             // Remove from in-flight cache on failure
             inFlightCache.delete(cacheKey);
@@ -255,84 +258,183 @@ export function parseExtras(requiresDist: string[] | null): Record<string, Recor
 }
 
 /**
- * Resolve a version specifier to a concrete version from available releases.
- * For simplicity, returns the latest version that satisfies the constraint,
- * or the latest available if no constraint or constraint cannot be satisfied.
+ * Resolve a PEP 440 version specifier to a concrete version from available releases.
+ * Supports compound specifiers (">=2.0,<3.0"), ~=, !=, ==, and wildcard equality.
+ * Returns the highest version satisfying all clauses, or latest as a fallback.
  */
 export function resolvePythonVersion(
     specifier: string | null,
     availableVersions: string[]
 ): string {
-    if (!specifier || specifier === '*') {
-        return availableVersions[availableVersions.length - 1];
+    const sorted = [...availableVersions].sort(comparePythonVersions);
+    const latest = sorted[sorted.length - 1];
+
+    if (!specifier || specifier === '*' || specifier === 'latest') {
+        return latest;
     }
 
-    // Handle exact version (==version)
-    if (specifier.startsWith('==')) {
-        const version = specifier.slice(2).trim();
-        if (availableVersions.includes(version)) {
-            return version;
-        }
+    // Bare version string (e.g., user typed "pillow@9.0.0") — treat as exact
+    const trimmed = specifier.trim();
+    if (/^v?\d+(\.\d+)*$/.test(trimmed) && !trimmed.includes('*')) {
+        if (sorted.includes(trimmed)) return trimmed;
+        const stripped = trimmed.replace(/^v/, '');
+        if (sorted.includes(stripped)) return stripped;
+        // Fall through to clause matching (acts as ==)
     }
 
-    // Handle plain version without operator (treat as exact match)
-    // This handles "9.0.0" when user types "pillow@9.0.0"
-    if (/^\d/.test(specifier) && !specifier.startsWith('>=') && !specifier.startsWith('<=') &&
-        !specifier.startsWith('>') && !specifier.startsWith('<') && !specifier.startsWith('~=') &&
-        !specifier.startsWith('!=')) {
-        if (availableVersions.includes(specifier)) {
-            return specifier;
-        }
+    const candidates = sorted.filter(v => satisfiesSpecifier(v, trimmed));
+    if (candidates.length === 0) {
+        return latest;
+    }
+    // Prefer stable releases over prereleases when both satisfy
+    const stable = candidates.filter(v => !isPythonPrerelease(v));
+    const pool = stable.length > 0 ? stable : candidates;
+    return pool[pool.length - 1];
+}
+
+const PY_PRE_ORDER: Record<string, number> = {
+    a: 0, alpha: 0, b: 1, beta: 1, c: 2, rc: 2, pre: 2, preview: 2
+};
+
+interface ParsedPyVersion {
+    epoch: number;
+    release: number[];
+    /** -1 = dev-only, 0=a, 1=b, 2=rc, 3 = final (no prerelease) */
+    preRank: number;
+    preNum: number;
+    /** -1 = no post release (sorts before any post) */
+    postNum: number;
+    /** dev number; versions WITH dev sort before same-stage versions without */
+    devNum: number;
+    valid: boolean;
+}
+
+function parsePyVersion(version: string): ParsedPyVersion {
+    const invalid: ParsedPyVersion = { epoch: 0, release: [], preRank: 3, preNum: 0, postNum: -1, devNum: Infinity, valid: false };
+    let v = version.trim().toLowerCase().split('+')[0]; // strip local segment
+    if (!v) return invalid;
+
+    let epoch = 0;
+    const epochMatch = v.match(/^(\d+)!/);
+    if (epochMatch) {
+        epoch = parseInt(epochMatch[1], 10);
+        v = v.slice(epochMatch[0].length);
+    }
+    if (v.startsWith('v')) v = v.slice(1); // leading 'v' is allowed by PEP 440
+
+    const releaseMatch = v.match(/^\d+(\.\d+)*/);
+    if (!releaseMatch) return invalid;
+    const release = releaseMatch[0].split('.').map(Number);
+    let rest = v.slice(releaseMatch[0].length);
+
+    let preRank = 3;
+    let preNum = 0;
+    let postNum = -1;
+    let devNum = Infinity;
+
+    const preMatch = rest.match(/^[._-]?(a|alpha|b|beta|c|rc|pre|preview)(\d*)/);
+    if (preMatch) {
+        preRank = PY_PRE_ORDER[preMatch[1]] ?? 2;
+        preNum = preMatch[2] ? parseInt(preMatch[2], 10) : 0;
+        rest = rest.slice(preMatch[0].length);
     }
 
-    // Handle >=, <=, >, <, ~= (compatible release), !=
-    // For simplicity, we'll try to find a matching version or fall back to latest
-    // A proper implementation would use a PEP 440 parser
-
-    // Try to find any version that might satisfy basic constraints
-    for (const version of [...availableVersions].reverse()) {
-        // Basic constraint checking - not a full PEP 440 implementation
-        if (specifier.startsWith('>=')) {
-            const minVersion = specifier.slice(2).trim();
-            if (comparePythonVersions(version, minVersion) >= 0) {
-                return version;
-            }
-        } else if (specifier.startsWith('<=')) {
-            const maxVersion = specifier.slice(2).trim();
-            if (comparePythonVersions(version, maxVersion) <= 0) {
-                return version;
-            }
-        } else if (specifier.startsWith('>')) {
-            const minVersion = specifier.slice(1).trim();
-            if (comparePythonVersions(version, minVersion) > 0) {
-                return version;
-            }
-        } else if (specifier.startsWith('<')) {
-            const maxVersion = specifier.slice(1).trim();
-            if (comparePythonVersions(version, maxVersion) < 0) {
-                return version;
-            }
-        }
+    // Post release: .postN, -N (legacy implicit), .revN, .rN
+    const postMatch = rest.match(/^(?:\.post|-(?!dev)|\.rev|\.r)(\d+)/);
+    if (postMatch) {
+        postNum = parseInt(postMatch[1], 10);
+        rest = rest.slice(postMatch[0].length);
     }
 
-    // Fallback to latest
-    return availableVersions[availableVersions.length - 1];
+    const devMatch = rest.match(/^\.?dev(\d*)/);
+    if (devMatch) {
+        devNum = devMatch[1] ? parseInt(devMatch[1], 10) : 0;
+        rest = rest.slice(devMatch[0].length);
+    }
+
+    // A bare .devN (no pre/post) sorts before any prerelease
+    if (devNum !== Infinity && preRank === 3 && postNum === -1) {
+        preRank = -1;
+    }
+
+    if (rest.length > 0) return invalid; // trailing garbage
+    return { epoch, release, preRank, preNum, postNum, devNum, valid: true };
+}
+
+function isPythonPrerelease(version: string): boolean {
+    const p = parsePyVersion(version);
+    return p.valid && (p.preRank >= -1 && p.preRank < 3 || p.devNum !== Infinity);
 }
 
 /**
- * Simple version comparison for Python versions.
- * Returns -1 if v1 < v2, 0 if v1 == v2, 1 if v1 > v2
+ * Compare two Python versions per PEP 440 ordering.
+ * Returns -1 if v1 < v2, 0 if equal, 1 if v1 > v2.
  */
-function comparePythonVersions(v1: string, v2: string): number {
-    const parts1 = v1.split(/[.-]/).map(p => parseInt(p, 10) || 0);
-    const parts2 = v2.split(/[.-]/).map(p => parseInt(p, 10) || 0);
+export function comparePythonVersions(v1: string, v2: string): number {
+    const a = parsePyVersion(v1);
+    const b = parsePyVersion(v2);
+    if (!a.valid && !b.valid) return v1.localeCompare(v2);
+    if (!a.valid) return -1;
+    if (!b.valid) return 1;
 
-    const maxLen = Math.max(parts1.length, parts2.length);
+    if (a.epoch !== b.epoch) return a.epoch < b.epoch ? -1 : 1;
+
+    const maxLen = Math.max(a.release.length, b.release.length);
     for (let i = 0; i < maxLen; i++) {
-        const a = parts1[i] || 0;
-        const b = parts2[i] || 0;
-        if (a < b) return -1;
-        if (a > b) return 1;
+        const x = a.release[i] ?? 0;
+        const y = b.release[i] ?? 0;
+        if (x !== y) return x < y ? -1 : 1;
     }
+
+    if (a.preRank !== b.preRank) return a.preRank < b.preRank ? -1 : 1;
+    if (a.preNum !== b.preNum) return a.preNum < b.preNum ? -1 : 1;
+    if (a.postNum !== b.postNum) return a.postNum < b.postNum ? -1 : 1;
+    if (a.devNum !== b.devNum) return a.devNum < b.devNum ? -1 : 1;
     return 0;
+}
+
+/** Check whether a version satisfies a full PEP 440 specifier set (comma-separated clauses) */
+function satisfiesSpecifier(version: string, specifier: string): boolean {
+    const clauses = specifier.split(',').map(c => c.trim()).filter(Boolean);
+    const parsed = parsePyVersion(version);
+
+    for (const clause of clauses) {
+        const m = clause.match(/^(===|==|~=|!=|>=|<=|>|<)\s*(.+)$/);
+        const op = m ? m[1] : '==';
+        const val = (m ? m[2] : clause).trim();
+
+        // Wildcard equality: ==1.2.* / !=1.2.*
+        if ((op === '==' || op === '!=') && val.endsWith('.*')) {
+            const prefix = val.slice(0, -2);
+            const matches = version === prefix || version.startsWith(prefix + '.');
+            if (op === '==' ? !matches : matches) return false;
+            continue;
+        }
+
+        // ~=V — compatible release: >=V, <V with last release segment bumped
+        if (op === '~=') {
+            const parts = val.split('.').map(Number);
+            if (parts.length < 2) return false; // invalid ~= spec
+            const upper = parts.slice(0, -1);
+            upper[upper.length - 1] += 1;
+            if (comparePythonVersions(version, val) < 0 ||
+                comparePythonVersions(version, upper.join('.')) >= 0) return false;
+            continue;
+        }
+
+        if (op === '===' || op === '==' || op === '!=') {
+            // Exact match; tolerate a leading 'v' or missing trailing segments
+            const eq = version === val || version === 'v' + val ||
+                (parsed.valid && comparePythonVersions(version, val) === 0);
+            if (op === '!=' ? eq : !eq) return false;
+            continue;
+        }
+
+        const cmp = comparePythonVersions(version, val);
+        if (op === '>=' && cmp < 0) return false;
+        if (op === '<=' && cmp > 0) return false;
+        if (op === '>' && cmp <= 0) return false;
+        if (op === '<' && cmp >= 0) return false;
+    }
+    return true;
 }

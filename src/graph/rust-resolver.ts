@@ -2,6 +2,7 @@ import { fetchPackageMeta, fetchVersionDependencies, resolveCargoVersion } from 
 import type { DependencySource, ProgressCallback, ResolvedGraph, ResolverOptions } from './resolver';
 import { MICROPACKAGE_SIZE_THRESHOLD } from './resolver';
 import { enrichBulkWithDepsDevData } from '../utils/depsdev-enrichment';
+import { AbortedError } from '../utils/retry';
 
 export interface CargoManifest {
     name: string;
@@ -41,10 +42,12 @@ async function runBfsRustResolution(
     };
 
     const processQueue = async () => {
+        if (options.signal?.aborted) throw new AbortedError();
         const CONCURRENCY = 10;
         const batch = queue.splice(0, CONCURRENCY);
 
         await Promise.all(batch.map(async ({ name, versionDef, parentId, depth, isOptional }) => {
+            if (options.signal?.aborted) throw new AbortedError();
             // Skip if we've reached max depth
             if (depth >= MAX_DEPTH) {
                 resolved++;
@@ -60,7 +63,7 @@ async function runBfsRustResolution(
             }
 
             try {
-                const meta = await fetchPackageMeta(name);
+                const meta = await fetchPackageMeta(name, options.signal);
 
                 // Get available versions from the versions array (sorted ascending)
                 const versions = meta.versions.map(v => v.num).sort((a, b) => {
@@ -135,7 +138,7 @@ async function runBfsRustResolution(
                 const uploadTime = versionData?.created_at || '';
 
                 // Fetch dependencies for this specific version
-                const rawDependencies = versionData?.dependencies || await fetchVersionDependencies(name, resolvedVersion);
+                const rawDependencies = versionData?.dependencies || await fetchVersionDependencies(name, resolvedVersion, options.signal);
 
                 // Parse dependencies - only normal (non-dev, non-build, non-optional) dependencies
                 const dependencies: Record<string, string> = {};
@@ -195,6 +198,7 @@ async function runBfsRustResolution(
                     }
                 }
             } catch (err: unknown) {
+                if (err instanceof AbortedError || options.signal?.aborted) throw new AbortedError();
                 const message = err instanceof Error ? err.message : 'Unknown dependency resolution error';
                 graph.errors.push({ pkg: name, error: message });
 
@@ -297,7 +301,7 @@ export async function resolveRustDependencyTreeFromManifest(
 /**
  * Enrich a resolved Rust graph with metadata from deps.dev.
  */
-export async function enrichRustGraphWithDepsDevData(graph: ResolvedGraph): Promise<void> {
+export async function enrichRustGraphWithDepsDevData(graph: ResolvedGraph, signal?: AbortSignal): Promise<void> {
     const cratesNodes = new Map();
     
     for (const [nodeId, node] of graph.nodes.entries()) {
@@ -307,6 +311,6 @@ export async function enrichRustGraphWithDepsDevData(graph: ResolvedGraph): Prom
     }
     
     if (cratesNodes.size > 0) {
-        await enrichBulkWithDepsDevData(cratesNodes, 'crates');
+        await enrichBulkWithDepsDevData(cratesNodes, 'crates', signal);
     }
 }

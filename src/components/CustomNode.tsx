@@ -2,7 +2,7 @@ import { Handle, Position } from '@xyflow/react';
 import clsx from 'classnames';
 import { flip, FloatingPortal, offset, safePolygon, shift, size, useFloating, useHover, useInteractions } from '@floating-ui/react';
 import { AlertTriangle, CircleAlert, ExternalLink, GitBranch, Github, Gitlab, Loader2, Package } from 'lucide-react';
-import { memo, useState } from 'react';
+import { memo, useCallback, useState } from 'react';
 import type { DependencySource, GraphNodeData } from '../graph/resolver';
 import { useNodeVisibility } from './useNodeVisibility';
 import type { WarningToggles } from './WarningTogglesPanel';
@@ -92,7 +92,7 @@ export const CustomNode = memo(function CustomNode({ data, selected, positionAbs
     // Floating UI tooltip
     const [isTooltipOpen, setIsTooltipOpen] = useState(false);
 
-    const { refs, floatingStyles, context } = useFloating({
+    const { refs: floatingUi, floatingStyles, context } = useFloating({
         open: isTooltipOpen,
         onOpenChange: setIsTooltipOpen,
         placement: 'top',
@@ -102,6 +102,10 @@ export const CustomNode = memo(function CustomNode({ data, selected, positionAbs
             shift({ padding: 16 }),
             size({ padding: 16 }),
         ] });
+    // floating-ui's setters are callback refs; wrapping them keeps the
+    // react-hooks/refs rule from treating them as ref reads during render
+    const setReference = useCallback((el: HTMLDivElement | null) => floatingUi.setReference(el), [floatingUi]);
+    const setFloating = useCallback((el: HTMLDivElement | null) => floatingUi.setFloating(el), [floatingUi]);
 
     const hover = useHover(context, { delay: { open: 300, close: 100 }, handleClose: safePolygon() });
     const { getReferenceProps, getFloatingProps } = useInteractions([hover]);
@@ -197,7 +201,7 @@ export const CustomNode = memo(function CustomNode({ data, selected, positionAbs
             if (major > 100 && minor > 100 && patch > 100) return true;
 
             // Date-like versions (20240315.x.x)
-            if (/^\d{8 }/.test(segments[0])) return true;
+            if (/^\d{8}$/.test(segments[0])) return true;
 
             // Prerelease deviations
             if (suffix) {
@@ -277,8 +281,7 @@ export const CustomNode = memo(function CustomNode({ data, selected, positionAbs
             licenseLower.includes('proprietary') ||
             licenseLower.includes('commercial') ||
             licenseLower.includes('all rights reserved') ||
-            licenseLower.includes('see license') ||
-            licenseLower.includes('see LICENSE')) {
+            licenseLower.includes('see license')) {
             return true;
         }
 
@@ -424,10 +427,6 @@ export const CustomNode = memo(function CustomNode({ data, selected, positionAbs
         if (!allowedLicenses.trim()) {
             // Check if any OSI-approved license is found in the license string
             const isApproved = osiApproved.some(l => licenseLower.includes(l));
-            // DEBUG: Log licenses that are being flagged
-            if (!isApproved && licenseLower) {
-                console.log(`[License Check] Flagging as non-OSI: "${license}" (lowercase: "${licenseLower}")`);
-            }
             return !isApproved;
         }
 
@@ -694,7 +693,7 @@ export const CustomNode = memo(function CustomNode({ data, selected, positionAbs
         return (
             <FloatingPortal>
                 <div
-                    ref={refs.setFloating}
+                    ref={setFloating}
                     style={{
                         ...floatingStyles,
                         background: 'rgba(15, 17, 21, 0.98)',
@@ -859,7 +858,7 @@ export const CustomNode = memo(function CustomNode({ data, selected, positionAbs
 
         return (
             <div
-                ref={refs.setReference}
+                ref={setReference}
                 className={lodClassName}
                 {...getReferenceProps()}
                 style={{
@@ -893,7 +892,7 @@ export const CustomNode = memo(function CustomNode({ data, selected, positionAbs
 
         return (
             <div
-                ref={refs.setReference}
+                ref={setReference}
                 className={lodClassName}
                 {...getReferenceProps()}
                 style={{
@@ -1003,7 +1002,7 @@ export const CustomNode = memo(function CustomNode({ data, selected, positionAbs
             !data.deprecated && !data.isOutdated && data.isPrereleaseAvailable && 'node-prerelease',
             isPending && 'node-pending'
         )}
-            ref={refs.setReference}
+            ref={setReference}
             {...getReferenceProps()}
             style={{
                 padding: '16px',

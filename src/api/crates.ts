@@ -1,3 +1,4 @@
+import semver from 'semver';
 import { PersistentCache } from '../utils/cache';
 import { PermanentError, withRetry } from '../utils/retry';
 
@@ -87,7 +88,7 @@ export interface CratesPackageMeta {
 // In-memory cache for in-flight requests (prevents duplicate concurrent fetches)
 const inFlightCache = new Map<string, Promise<CratesPackageMeta>>();
 
-export async function fetchPackageMeta(name: string): Promise<CratesPackageMeta> {
+export async function fetchPackageMeta(name: string, signal?: AbortSignal): Promise<CratesPackageMeta> {
     const cacheKey = `crates:${name.toLowerCase()}`;
 
     // Check in-memory cache for in-flight requests first
@@ -100,7 +101,7 @@ export async function fetchPackageMeta(name: string): Promise<CratesPackageMeta>
         try {
             return await withRetry(async () => {
                 // First fetch the crate metadata
-                const res = await fetch(`https://crates.io/api/v1/crates/${encodeURIComponent(name)}`);
+                const res = await fetch(`https://crates.io/api/v1/crates/${encodeURIComponent(name)}`, { signal });
                 if (res.status >= 400 && res.status < 500) {
                     throw new PermanentError(`Crate "${name}" not found (${res.status})`);
                 }
@@ -109,16 +110,22 @@ export async function fetchPackageMeta(name: string): Promise<CratesPackageMeta>
                 }
                 const data = await res.json() as CratesPackageMeta;
 
-                // Then fetch dependencies for the latest version
-                if (data.versions.length > 0) {
-                    const latestVersion = data.versions[0];
+                // Then fetch dependencies for the latest stable version
+                // (versions[0] is not guaranteed to be the newest — resolve by semver)
+                const latestVersion = resolveCargoVersion(
+                    data.crate.max_stable_version || data.crate.max_version || '*',
+                    data.versions.map(v => v.num)
+                );
+                const latestVersionData = data.versions.find(v => v.num === latestVersion);
+                if (latestVersionData) {
                     try {
                         const depsRes = await fetch(
-                            `https://crates.io/api/v1/crates/${encodeURIComponent(name)}/${latestVersion.num}/dependencies`
+                            `https://crates.io/api/v1/crates/${encodeURIComponent(name)}/${latestVersionData.num}/dependencies`,
+                            { signal }
                         );
                         if (depsRes.ok) {
                             const depsData = await depsRes.json();
-                            latestVersion.dependencies = depsData.dependencies || [];
+                            latestVersionData.dependencies = depsData.dependencies || [];
                         }
                     } catch {
                         // Ignore dependency fetch errors
@@ -129,7 +136,7 @@ export async function fetchPackageMeta(name: string): Promise<CratesPackageMeta>
                 await PersistentCache.setRegistry(cacheKey, data);
 
                 return data;
-            });
+            }, 5, 2500, signal);
         } catch (err) {
             // Remove from in-flight cache on failure
             inFlightCache.delete(cacheKey);
@@ -151,7 +158,8 @@ const inFlightDepCache = new Map<string, Promise<CratesDependency[]>>();
  */
 export async function fetchVersionDependencies(
     name: string,
-    version: string
+    version: string,
+    signal?: AbortSignal
 ): Promise<CratesDependency[]> {
     const cacheKey = `crates:deps:${name.toLowerCase()}:${version}`;
 
@@ -165,7 +173,8 @@ export async function fetchVersionDependencies(
         try {
             return await withRetry(async () => {
                 const res = await fetch(
-                    `https://crates.io/api/v1/crates/${encodeURIComponent(name)}/${encodeURIComponent(version)}/dependencies`
+                    `https://crates.io/api/v1/crates/${encodeURIComponent(name)}/${encodeURIComponent(version)}/dependencies`,
+                    { signal }
                 );
                 if (!res.ok) {
                     throw new Error(`Failed to fetch dependencies: ${res.statusText} (${res.status})`);
@@ -177,7 +186,7 @@ export async function fetchVersionDependencies(
                 await PersistentCache.setRegistry(cacheKey, deps);
 
                 return deps;
-            });
+            }, 5, 2500, signal);
         } catch (err) {
             // Remove from in-flight cache on failure
             inFlightDepCache.delete(cacheKey);
@@ -192,158 +201,45 @@ export async function fetchVersionDependencies(
 }
 
 /**
- * Parse Cargo.toml-style version requirement to extract a simple version spec.
- * Returns the latest version that satisfies the requirement from available versions.
+ * Resolve a Cargo.toml-style version requirement to the latest satisfying version.
+ * Cargo semantics: a bare version means caret-compatible ("1.2" ≡ "^1.2"),
+ * and resolution picks the maximum satisfying version.
  */
 export function resolveCargoVersion(
     requirement: string,
     availableVersions: string[]
 ): string {
-    if (!requirement || requirement === '*') {
-        return availableVersions[availableVersions.length - 1];
+    const versions = availableVersions.filter(v => semver.valid(v)).sort(semver.compare);
+    const latest = versions[versions.length - 1] || availableVersions[availableVersions.length - 1];
+    if (!latest) return requirement;
+
+    const req = (requirement || '*').trim();
+    if (req === '*' || req === 'latest' || req === '') {
+        return latest;
     }
 
-    // Handle caret (^) requirements - compatible version
-    if (requirement.startsWith('^')) {
-        const version = requirement.slice(1).trim();
-        return findCompatibleVersion(version, availableVersions);
+    // Fully-qualified version that exists in the list — use it directly.
+    // (Partial versions like "1.2" keep Cargo's implied-caret semantics below.)
+    if (/^v?\d+\.\d+\.\d+/.test(req) && versions.includes(req)) {
+        return req;
     }
 
-    // Handle tilde (~) requirements - approximate version
-    if (requirement.startsWith('~')) {
-        const version = requirement.slice(1).trim();
-        return findCompatibleVersion(version, availableVersions);
+    // Translate Cargo requirement syntax to a semver range:
+    // - comma-separated clauses become space-separated
+    // - bare versions get an implicit caret ("1.2" ≡ "^1.2", Cargo semantics)
+    // - "=" prefix means exact match
+    const clauses = req.split(',').map(c => c.trim()).filter(Boolean).map(clause => {
+        if (clause.startsWith('=')) return clause.slice(1);
+        if (/^[\^~<>=*]/.test(clause)) return clause;
+        if (/^v?\d/.test(clause)) return `^${clause.replace(/^v/, '')}`;
+        return clause;
+    });
+    const range = clauses.join(' ');
+
+    try {
+        const max = semver.maxSatisfying(versions, range, { includePrerelease: /\d-/.test(range) });
+        return max ?? latest;
+    } catch {
+        return latest;
     }
-
-    // Handle exact (=) requirements
-    if (requirement.startsWith('=')) {
-        const version = requirement.slice(1).trim();
-        if (availableVersions.includes(version)) {
-            return version;
-        }
-    }
-
-    // Handle comparison operators
-    if (requirement.startsWith('>=')) {
-        const minVersion = requirement.slice(2).trim();
-        return findMinVersion(minVersion, availableVersions);
-    }
-
-    if (requirement.startsWith('>')) {
-        const minVersion = requirement.slice(1).trim();
-        return findGreaterVersion(minVersion, availableVersions);
-    }
-
-    if (requirement.startsWith('<=')) {
-        const maxVersion = requirement.slice(2).trim();
-        return findMaxVersion(maxVersion, availableVersions);
-    }
-
-    if (requirement.startsWith('<')) {
-        const maxVersion = requirement.slice(1).trim();
-        return findLessVersion(maxVersion, availableVersions);
-    }
-
-    // Handle version ranges with comma (e.g., ">=1.0, <2.0")
-    if (requirement.includes(',')) {
-        // For simplicity, try to find the latest that satisfies the lower bound
-        const parts = requirement.split(',');
-        for (const part of parts) {
-            const trimmed = part.trim();
-            if (trimmed.startsWith('>=')) {
-                const minVersion = trimmed.slice(2).trim();
-                return findMinVersion(minVersion, availableVersions);
-            }
-            if (trimmed.startsWith('>')) {
-                const minVersion = trimmed.slice(1).trim();
-                return findGreaterVersion(minVersion, availableVersions);
-            }
-        }
-    }
-
-    // Default: if it's a plain version string that exactly matches an available version, use it
-    if (availableVersions.includes(requirement)) {
-        return requirement;
-    }
-
-    // Otherwise treat as a caret-style compatible version
-    return findCompatibleVersion(requirement, availableVersions);
-}
-
-function findCompatibleVersion(version: string, availableVersions: string[]): string {
-    const parts = version.split('.');
-    const major = parts[0] || '0';
-    const minor = parts[1] || '0';
-
-    // Find latest version with same major and at least same minor
-    for (let i = availableVersions.length - 1; i >= 0; i--) {
-        const v = availableVersions[i];
-        const vParts = v.split('.');
-        const vMajor = vParts[0] || '0';
-        const vMinor = vParts[1] || '0';
-
-        if (vMajor === major && parseInt(vMinor) >= parseInt(minor)) {
-            return v;
-        }
-        if (parseInt(vMajor) > parseInt(major)) {
-            // Too far ahead, stop looking
-            break;
-        }
-    }
-
-    return availableVersions[availableVersions.length - 1] || version;
-}
-
-function findMinVersion(minVersion: string, availableVersions: string[]): string {
-    for (const v of availableVersions) {
-        if (compareVersions(v, minVersion) >= 0) {
-            return v;
-        }
-    }
-    return availableVersions[availableVersions.length - 1] || minVersion;
-}
-
-function findGreaterVersion(minVersion: string, availableVersions: string[]): string {
-    for (const v of availableVersions) {
-        if (compareVersions(v, minVersion) > 0) {
-            return v;
-        }
-    }
-    return availableVersions[availableVersions.length - 1] || minVersion;
-}
-
-function findMaxVersion(maxVersion: string, availableVersions: string[]): string {
-    for (let i = availableVersions.length - 1; i >= 0; i--) {
-        if (compareVersions(availableVersions[i], maxVersion) <= 0) {
-            return availableVersions[i];
-        }
-    }
-    return availableVersions[0] || maxVersion;
-}
-
-function findLessVersion(maxVersion: string, availableVersions: string[]): string {
-    for (let i = availableVersions.length - 1; i >= 0; i--) {
-        if (compareVersions(availableVersions[i], maxVersion) < 0) {
-            return availableVersions[i];
-        }
-    }
-    return availableVersions[0] || maxVersion;
-}
-
-/**
- * Compare two semantic versions.
- * Returns -1 if v1 < v2, 0 if v1 == v2, 1 if v1 > v2
- */
-function compareVersions(v1: string, v2: string): number {
-    const parts1 = v1.split(/[.-]/).map(p => parseInt(p, 10) || 0);
-    const parts2 = v2.split(/[.-]/).map(p => parseInt(p, 10) || 0);
-
-    const maxLen = Math.max(parts1.length, parts2.length);
-    for (let i = 0; i < maxLen; i++) {
-        const a = parts1[i] || 0;
-        const b = parts2[i] || 0;
-        if (a < b) return -1;
-        if (a > b) return 1;
-    }
-    return 0;
 }

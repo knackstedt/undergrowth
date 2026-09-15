@@ -42,7 +42,11 @@ export function SidebarInfo({ nodeData, micropackageThreshold = 6144, isOpen, on
             // Reset downloads when node changes - this is intentional and not a bug
             // eslint-disable-next-line react-hooks/set-state-in-effect
             setDownloads(null);
-            getDownloads(nodeData.pkgName).then((d: number | null) => setDownloads(d));
+            // Download counts are only available from the npm API — other
+            // ecosystems would just 404 and leave the card loading forever
+            if (!nodeData.source || nodeData.source === 'npm') {
+                getDownloads(nodeData.pkgName).then((d: number | null) => setDownloads(d));
+            }
         }
     }, [isOpen, nodeData]);
 
@@ -82,7 +86,7 @@ export function SidebarInfo({ nodeData, micropackageThreshold = 6144, isOpen, on
 
     const downloadsStr = downloads !== null
         ? new Intl.NumberFormat('en-US').format(downloads)
-        : 'Loading...';
+        : (nodeData?.source && nodeData.source !== 'npm' ? 'N/A' : 'Loading...');
 
     const depsCount = Object.keys(nodeData?.dependencies || {}).length;
 

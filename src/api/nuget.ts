@@ -77,12 +77,12 @@ const NUGET_INDEX_URL = 'https://api.nuget.org/v3/index.json';
 
 let nugetServiceIndex: { resources: Array<{ '@type': string; '@id': string }> } | null = null;
 
-async function getServiceIndex(): Promise<{ resources: Array<{ '@type': string; '@id': string }> }> {
+async function getServiceIndex(signal?: AbortSignal): Promise<{ resources: Array<{ '@type': string; '@id': string }> }> {
     if (nugetServiceIndex) {
         return nugetServiceIndex;
     }
 
-    const response = await fetch(NUGET_INDEX_URL);
+    const response = await fetch(NUGET_INDEX_URL, { signal });
     if (!response.ok) {
         throw new Error(`Failed to fetch NuGet service index: ${response.statusText}`);
     }
@@ -99,7 +99,7 @@ function getResourceUrl(serviceIndex: { resources: Array<{ '@type': string; '@id
 // In-memory cache for in-flight requests (prevents duplicate concurrent fetches)
 const inFlightCache = new Map<string, Promise<NuGetPackageMeta>>();
 
-export async function fetchPackageMeta(name: string): Promise<NuGetPackageMeta> {
+export async function fetchPackageMeta(name: string, signal?: AbortSignal): Promise<NuGetPackageMeta> {
     const cacheKey = `nuget:${name.toLowerCase()}`;
 
     // Check in-memory cache for in-flight requests first
@@ -111,7 +111,7 @@ export async function fetchPackageMeta(name: string): Promise<NuGetPackageMeta> 
     const fetchAndCache = async (): Promise<NuGetPackageMeta> => {
         try {
             return await withRetry(async () => {
-                const serviceIndex = await getServiceIndex();
+                const serviceIndex = await getServiceIndex(signal);
                 const searchBaseUrl = getResourceUrl(serviceIndex, 'SearchQueryService');
 
                 if (!searchBaseUrl) {
@@ -120,7 +120,7 @@ export async function fetchPackageMeta(name: string): Promise<NuGetPackageMeta> 
 
                 // Search for the package
                 const searchUrl = `${searchBaseUrl}?q=packageid:${encodeURIComponent(name)}&take=1&prerelease=false&semVerLevel=2.0.0`;
-                const searchRes = await fetch(searchUrl);
+                const searchRes = await fetch(searchUrl, { signal });
 
                 if (!searchRes.ok) {
                     throw new Error(`Failed to search NuGet package ${name}: ${searchRes.statusText}`);
@@ -146,7 +146,7 @@ export async function fetchPackageMeta(name: string): Promise<NuGetPackageMeta> 
                 await PersistentCache.setRegistry(cacheKey, packageData);
 
                 return packageData;
-            });
+            }, 5, 2500, signal);
         } catch (err) {
             // Remove from in-flight cache on failure
             inFlightCache.delete(cacheKey);
@@ -169,7 +169,8 @@ const inFlightDepCache = new Map<string, Promise<NuGetDependencyGroup[]>>();
  */
 export async function fetchVersionDependencies(
     name: string,
-    version: string
+    version: string,
+    signal?: AbortSignal
 ): Promise<NuGetDependencyGroup[]> {
     const cacheKey = `nuget:deps:${name.toLowerCase()}:${version}`;
 
@@ -182,7 +183,7 @@ export async function fetchVersionDependencies(
     const fetchAndCache = async (): Promise<NuGetDependencyGroup[]> => {
         try {
             return await withRetry(async () => {
-                const serviceIndex = await getServiceIndex();
+                const serviceIndex = await getServiceIndex(signal);
                 const regBaseUrl = getResourceUrl(serviceIndex, 'RegistrationsBaseUrl');
 
                 if (!regBaseUrl) {
@@ -198,27 +199,23 @@ export async function fetchVersionDependencies(
                 const baseUrl = regBaseUrl.endsWith('/') ? regBaseUrl : `${regBaseUrl}/`;
                 const regUrl = `${baseUrl}${lowerName}/${normalizedVersion}.json`;
 
-                console.log(`[NuGet] Fetching dependencies from: ${regUrl}`);
-                const res = await fetch(regUrl);
+                const res = await fetch(regUrl, { signal });
 
                 let groups: NuGetDependencyGroup[] = [];
 
                 if (!res.ok) {
                     console.warn(`[NuGet] Registration fetch failed: ${res.status} ${res.statusText} for ${name}@${version}`);
                     // Fallback: try to get dependencies from the package metadata
-                    const meta = await fetchPackageMeta(name);
-                    console.log(`[NuGet] Fallback meta.dependencyGroups:`, meta.dependencyGroups);
+                    const meta = await fetchPackageMeta(name, signal);
                     groups = meta.dependencyGroups || [];
                 } else {
                     const data = await res.json() as { dependencyGroups?: NuGetDependencyGroup[]; catalogEntry?: { dependencyGroups?: NuGetDependencyGroup[] } | string };
-                    console.log(`[NuGet] Response keys:`, Object.keys(data));
 
                     groups = data.dependencyGroups || [];
 
                     // If catalogEntry is a URL string, fetch it to get dependency groups
                     if (typeof data.catalogEntry === 'string') {
-                        console.log(`[NuGet] Fetching catalogEntry from: ${data.catalogEntry}`);
-                        const catalogRes = await fetch(data.catalogEntry);
+                        const catalogRes = await fetch(data.catalogEntry, { signal });
                         if (catalogRes.ok) {
                             const catalogData = await catalogRes.json() as { dependencyGroups?: NuGetDependencyGroup[] };
                             groups = catalogData.dependencyGroups || [];
@@ -229,13 +226,11 @@ export async function fetchVersionDependencies(
                     }
                 }
 
-                console.log(`[NuGet] Fetched ${groups.length} dependency groups for ${name}@${version}`);
-
                 // Cache the result
                 await PersistentCache.setRegistry(cacheKey, groups);
 
                 return groups;
-            });
+            }, 5, 2500, signal);
         } catch (err) {
             // Remove from in-flight cache on failure
             inFlightDepCache.delete(cacheKey);

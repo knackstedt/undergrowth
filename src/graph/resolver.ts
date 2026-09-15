@@ -1,5 +1,6 @@
 import { fetchPackageMeta } from '../api/npm';
 import { enrichBulkWithDepsDevData } from '../utils/depsdev-enrichment';
+import { AbortedError } from '../utils/retry';
 import { isPrerelease } from './timeline';
 
 export type DependencySource = 'npm' | 'pypi' | 'crates' | 'go' | 'nuget' | 'github' | 'gitlab' | 'bitbucket' | 'external' | 'other';
@@ -173,11 +174,12 @@ export type ProgressCallback = (resolved: number, total: number) => void;
 
 export interface ResolverOptions {
     showPeerDeps?: boolean;
+    signal?: AbortSignal;
 }
 
 async function runBfsResolution(
     graph: ResolvedGraph,
-    queue: Array<{ name: string; versionDef: string; parentId: string | null; isPeer?: boolean; }>,
+    queue: Array<{ name: string; versionDef: string; parentId: string | null; isPeer?: boolean; isDev?: boolean; }>,
     options: ResolverOptions = {},
     onProgress?: ProgressCallback
 ): Promise<void> {
@@ -186,14 +188,16 @@ async function runBfsResolution(
     let total = queue.length;
 
     const processQueue = async () => {
+        if (options.signal?.aborted) throw new AbortedError();
         const CONCURRENCY = 10;
         const batch = queue.splice(0, CONCURRENCY);
 
-        await Promise.all(batch.map(async ({ name, versionDef, parentId, isPeer }) => {
+        await Promise.all(batch.map(async ({ name, versionDef, parentId, isPeer, isDev }) => {
+            if (options.signal?.aborted) throw new AbortedError();
             let resolvedVersion = versionDef;
 
             try {
-                const meta = await fetchPackageMeta(name);
+                const meta = await fetchPackageMeta(name, options.signal);
 
                 const versions = Object.keys(meta.versions);
                 if (versionDef === 'latest') {
@@ -205,7 +209,7 @@ async function runBfsResolution(
                 const nodeId = `${name}@${resolvedVersion}`;
 
                 if (parentId) {
-                    const edgeType = isPeer ? 'peer' : 'dependency';
+                    const edgeType = isPeer ? 'peer' : isDev ? 'dev' : 'dependency';
                     if (!graph.edges.find(e => e.source === parentId && e.target === nodeId)) {
                         graph.edges.push({ source: parentId, target: nodeId, type: edgeType });
                     }
@@ -310,11 +314,6 @@ async function runBfsResolution(
                 // pkgData.license is already normalized to string by npm.ts fetchPackageMeta
                 const licenseStr = pkgData.license;
 
-                // DEBUG: Log license data for root packages
-                if (isRoot) {
-                    console.log(`[Resolver] Creating root node ${nodeId} with license:`, JSON.stringify(licenseStr));
-                }
-
                 const size = pkgData.dist?.unpackedSize;
                 const fileCount = pkgData.dist?.fileCount;
                 const hasSizeData = size !== undefined && size > 0;
@@ -360,6 +359,7 @@ async function runBfsResolution(
                     }
                 }
             } catch (err: unknown) {
+                if (err instanceof AbortedError || options.signal?.aborted) throw new AbortedError();
                 const message = err instanceof Error ? err.message : 'Unknown dependency resolution error';
                 graph.errors.push({ pkg: name, error: message });
 
@@ -472,7 +472,11 @@ export async function resolveDependencyTreeFromManifest(manifest: LocalManifest,
     };
 
     const rootId = `${manifest.name}@${manifest.version || 'local'}`;
-    const allDeps = { ...manifest.dependencies };
+    const allDeps = {
+        ...manifest.dependencies,
+        ...manifest.devDependencies,
+        ...(options.showPeerDeps ? manifest.peerDependencies : {})
+    };
 
     graph.nodes.set(rootId, {
         id: rootId,
@@ -486,10 +490,24 @@ export async function resolveDependencyTreeFromManifest(manifest: LocalManifest,
         source: 'npm' // Root from manifest is effectively the local npm package
     });
 
-    const queue = Object.entries(allDeps).map(([name, versionDef]) => ({
-        name,
-        versionDef,
-        parentId: rootId }));
+    const queue = [
+        ...Object.entries(manifest.dependencies || {}).map(([name, versionDef]) => ({
+            name,
+            versionDef,
+            parentId: rootId as string | null })),
+        ...Object.entries(manifest.devDependencies || {}).map(([name, versionDef]) => ({
+            name,
+            versionDef,
+            parentId: rootId as string | null,
+            isDev: true })),
+        ...(options.showPeerDeps
+            ? Object.entries(manifest.peerDependencies || {}).map(([name, versionDef]) => ({
+                name,
+                versionDef,
+                parentId: rootId as string | null,
+                isPeer: true }))
+            : [])
+    ];
 
     await runBfsResolution(graph, queue, options, onProgress);
 
@@ -504,7 +522,7 @@ export async function resolveDependencyTreeFromManifest(manifest: LocalManifest,
  * This provides enhanced license information and security advisories.
  * Should be called after dependency resolution is complete.
  */
-export async function enrichGraphWithDepsDevData(graph: ResolvedGraph): Promise<void> {
+export async function enrichGraphWithDepsDevData(graph: ResolvedGraph, signal?: AbortSignal): Promise<void> {
     const nodesBySource = new Map<DependencySource, Map<string, GraphNodeData>>();
     
     for (const node of graph.nodes.values()) {
@@ -520,7 +538,7 @@ export async function enrichGraphWithDepsDevData(graph: ResolvedGraph): Promise<
     }
     
     const enrichmentPromises = Array.from(nodesBySource.entries()).map(([source, nodes]) => {
-        return enrichBulkWithDepsDevData(nodes, source);
+        return enrichBulkWithDepsDevData(nodes, source, signal);
     });
     
     await Promise.allSettled(enrichmentPromises);
