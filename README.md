@@ -33,6 +33,12 @@
 
 - **Comparison Mode**: Compare two versions of a dependency tree side-by-side. Visual diff highlighting shows packages that are new (green), removed (red), updated (amber), or unchanged (dimmed). Supports comparing package versions or dragging-and-drop manifest files (`package.json`, `requirements.txt`, `go.mod`, `Cargo.toml`, `.csproj`).
 
+- **Package Traits (npm)**: Badges on package cards indicate published capabilities:
+  - `⌨` **CLI** — the package publishes executables via its `bin` field (command names shown in the sidebar)
+  - `Cpu` **Native** — native code detected: N-API/napi-rs addons (`napi` config, `node-addon-api`), node-gyp builds (`gypfile`, `binding.gyp`, install scripts), prebuild downloads (`prebuild-install`, `node-gyp-build`, `node-pre-gyp`), or per-platform binary packages (`@scope/pkg-linux-x64-gnu`-style optional deps, `os`/`cpu`/`libc` constraints)
+  - `Binary` **WASM** — WebAssembly payloads detected via `wasm32`/`wasi` targets or `.wasm` files in the published tarball (file listing fetched from unpkg; catches wasm packages that leave no metadata trace, e.g. `@dqbd/tiktoken`)
+  - Click a node to see the "Package Traits" section with kind chips, detection evidence, and the actual binary file paths found in the tarball.
+
 ## Usage
 
 1. Select your ecosystem (npm, PyPI, Crates, Go, or NuGet) from the dropdown.

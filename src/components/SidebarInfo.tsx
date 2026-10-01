@@ -1,4 +1,5 @@
-import { Archive, Download, ExternalLink, GitCommit, GitFork, Link as LinkIcon, Star, Users, X } from 'lucide-react';
+import { Archive, Binary, Cpu, Download, ExternalLink, GitCommit, GitFork, Link as LinkIcon, Star, Terminal, Users, X } from 'lucide-react';
+import { NATIVE_KIND_LABELS } from '../graph/native';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { getDownloads } from '../api/npm';
 import type { DependencySource, GraphNodeData } from '../graph/resolver';
@@ -165,6 +166,59 @@ export function SidebarInfo({ nodeData, micropackageThreshold = MICROPACKAGE_SIZ
                                 <ExternalLink size={14} /> deps.dev
                             </a>
                         </div>
+
+                        {(nodeData.cliCommands?.length || nodeData.nativeKinds?.length) && (
+                            <div className="glass-panel" style={{ padding: '16px', borderRadius: '8px' }}>
+                                <h4 style={{ margin: '0 0 12px 0', fontSize: '16px', color: 'var(--text-primary)', borderBottom: '1px solid var(--border-color)', paddingBottom: '8px' }}>Package Traits</h4>
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                                    {nodeData.cliCommands && nodeData.cliCommands.length > 0 && (
+                                        <div>
+                                            <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '4px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                                <Terminal size={13} /> CLI Commands
+                                            </div>
+                                            <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                                                {nodeData.cliCommands.map((cmd, idx) => (
+                                                    <span key={idx} style={{ padding: '3px 8px', background: 'rgba(6, 182, 212, 0.15)', color: 'var(--accent-cyan)', borderRadius: '4px', fontSize: '12px', fontFamily: 'monospace' }}>
+                                                        {cmd}
+                                                    </span>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    )}
+                                    {nodeData.nativeKinds && nodeData.nativeKinds.length > 0 && (
+                                        <div>
+                                            <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '4px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                                {nodeData.nativeKinds.includes('wasm') ? <Binary size={13} /> : <Cpu size={13} />} Native / WASM
+                                            </div>
+                                            <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', marginBottom: nodeData.nativeDetails?.length ? '6px' : 0 }}>
+                                                {nodeData.nativeKinds.map((kind, idx) => (
+                                                    <span key={idx} style={{ padding: '3px 8px', background: 'rgba(245, 158, 11, 0.15)', color: 'var(--accent-amber)', borderRadius: '4px', fontSize: '12px' }}>
+                                                        {NATIVE_KIND_LABELS[kind]}
+                                                    </span>
+                                                ))}
+                                            </div>
+                                            {nodeData.nativeDetails && nodeData.nativeDetails.length > 0 && (
+                                                <div style={{ fontSize: '12px', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+                                                    {nodeData.nativeDetails.map((d, idx) => (
+                                                        <div key={idx}>• {d}</div>
+                                                    ))}
+                                                </div>
+                                            )}
+                                            {nodeData.nativeArtifacts && (nodeData.nativeArtifacts.wasm.length > 0 || nodeData.nativeArtifacts.addons.length > 0 || nodeData.nativeArtifacts.other.length > 0) && (
+                                                <div style={{ marginTop: '6px' }}>
+                                                    <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '4px' }}>Binary files in tarball</div>
+                                                    <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                                                        {[...nodeData.nativeArtifacts.wasm, ...nodeData.nativeArtifacts.addons, ...nodeData.nativeArtifacts.other].map((p, idx) => (
+                                                            <span key={idx} style={{ fontSize: '11px', fontFamily: 'monospace', color: 'var(--text-secondary)', wordBreak: 'break-all' }}>{p}</span>
+                                                        ))}
+                                                    </div>
+                                                </div>
+                                            )}
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        )}
 
                         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
                             <div className="glass-panel" style={{ padding: '12px', borderRadius: '8px' }}>

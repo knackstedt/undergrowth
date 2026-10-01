@@ -9,6 +9,7 @@ interface RawNpmPackageVersion {
     deprecated?: string | boolean;
     dependencies?: Record<string, string>;
     devDependencies?: Record<string, string>;
+    optionalDependencies?: Record<string, string>;
     peerDependencies?: Record<string, string>;
     repository?: { type: string; url: string; };
     maintainers?: Array<{ name: string; email: string; }>;
@@ -21,6 +22,19 @@ interface RawNpmPackageVersion {
     types?: string;
     typings?: string;
     license?: string | { type?: string; url?: string } | Array<{ type?: string; url?: string }>;
+    /** Published CLI executables (command name -> script path, or bare path string) */
+    bin?: string | Record<string, string>;
+    /** Install lifecycle scripts — retained for native-build detection */
+    scripts?: Record<string, string>;
+    /** napi-rs configuration block (declares binaryName + target triples) */
+    napi?: { binaryName?: string; name?: string; targets?: string[]; };
+    /** node-pre-gyp binary distribution block */
+    binary?: { module_name?: string; host?: string; package_name?: string; };
+    /** True when the package ships a binding.gyp (node-gyp build) */
+    gypfile?: boolean;
+    os?: string[];
+    cpu?: string[];
+    libc?: string[];
     dist?: {
         unpackedSize?: number;
         fileCount?: number;
@@ -35,6 +49,7 @@ export interface NpmPackageVersion {
     deprecated?: string | boolean;
     dependencies?: Record<string, string>;
     devDependencies?: Record<string, string>;
+    optionalDependencies?: Record<string, string>;
     peerDependencies?: Record<string, string>;
     repository?: { type: string; url: string; };
     maintainers?: Array<{ name: string; email: string; }>;
@@ -47,6 +62,14 @@ export interface NpmPackageVersion {
     types?: string;
     typings?: string;
     license?: string; // Normalized to string from API response
+    bin?: string | Record<string, string>;
+    scripts?: Record<string, string>;
+    napi?: { binaryName?: string; name?: string; targets?: string[]; };
+    binary?: { module_name?: string; host?: string; package_name?: string; };
+    gypfile?: boolean;
+    os?: string[];
+    cpu?: string[];
+    libc?: string[];
     dist?: {
         unpackedSize?: number;
         fileCount?: number;
@@ -99,12 +122,25 @@ export async function fetchPackageMeta(name: string, signal?: AbortSignal): Prom
                         licenseStr = (pkg.license as { type?: string }).type || '';
                     }
                 }
+                // Keep only install lifecycle hooks — used for native-build
+                // detection; full scripts blocks are large and useless to us
+                let installScripts: Record<string, string> | undefined;
+                if (pkg.scripts) {
+                    for (const hook of ['preinstall', 'install', 'postinstall']) {
+                        if (pkg.scripts[hook]) {
+                            installScripts = installScripts || {};
+                            installScripts[hook] = pkg.scripts[hook];
+                        }
+                    }
+                }
+
                 strippedVersions[version] = {
                     name: pkg.name,
                     version: pkg.version,
                     description: pkg.description,
                     deprecated: pkg.deprecated,
                     dependencies: pkg.dependencies,
+                    optionalDependencies: pkg.optionalDependencies,
                     peerDependencies: pkg.peerDependencies,
                     repository: pkg.repository,
                     maintainers: pkg.maintainers,
@@ -114,6 +150,14 @@ export async function fetchPackageMeta(name: string, signal?: AbortSignal): Prom
                     module: pkg.module,
                     types: pkg.types,
                     typings: pkg.typings,
+                    bin: pkg.bin,
+                    scripts: installScripts,
+                    napi: pkg.napi,
+                    binary: pkg.binary,
+                    gypfile: pkg.gypfile,
+                    os: pkg.os,
+                    cpu: pkg.cpu,
+                    libc: pkg.libc,
                     dist: pkg.dist,
                     license: licenseStr
                 };

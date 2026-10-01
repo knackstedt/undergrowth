@@ -63,6 +63,51 @@ export async function fetchBundleSize(name: string, version: string, signal?: Ab
     });
 }
 
+export interface NpmFileArtifacts {
+    /** Every file path in the published tarball (capped) */
+    paths: string[];
+}
+
+interface UnpkgMetaEntry {
+    path: string;
+    /** MIME type for files (e.g. "application/wasm") — directories appear via nested `files` */
+    type?: string;
+    files?: UnpkgMetaEntry[];
+}
+
+const UNPKG_PATH_CAP = 4000;
+
+/**
+ * unpkg `?meta` — file listing for a published npm version.
+ * Used to detect `.wasm` / `.node` / `binding.gyp` payloads that leave
+ * no trace in registry metadata. npm package names are URL-safe, so the
+ * scoped `@a/b` form is embedded verbatim (unpkg expects the slash).
+ *
+ * Response shape: { files: [{ path, type: "<mime>" }] } — flat for most
+ * packages; a nested `files` array is handled defensively.
+ */
+export async function fetchPackageFileList(name: string, version: string, signal?: AbortSignal): Promise<NpmFileArtifacts | null> {
+    return PersistentCache.getOrComputeRegistry(`unpkg-meta:${name}@${version}`, async () => {
+        try {
+            const res = await fetch(`https://unpkg.com/${name}@${encodeURIComponent(version)}/?meta`, { signal });
+            if (!res.ok) return null;
+            const data = await res.json() as { files?: UnpkgMetaEntry[] };
+            const paths: string[] = [];
+            const walk = (entries: UnpkgMetaEntry[] | undefined) => {
+                for (const entry of entries || []) {
+                    if (paths.length >= UNPKG_PATH_CAP) return;
+                    if (entry.files) walk(entry.files);
+                    else if (entry.path) paths.push(entry.path);
+                }
+            };
+            walk(data.files);
+            return { paths };
+        } catch {
+            return null;
+        }
+    });
+}
+
 /** ungh.cc — GitHub repo stats without requiring a token. */
 export async function fetchRepoStats(owner: string, repo: string, signal?: AbortSignal): Promise<RepoStats | null> {
     return PersistentCache.getOrComputeRegistry(`ungh:${owner}/${repo}`, async () => {

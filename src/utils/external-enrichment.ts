@@ -1,4 +1,5 @@
-import { extractGithubRepo, fetchBundleSize, fetchLibrariesIoInfo, fetchRepologyRepos, fetchRepoStats, isLibrariesIoEnabled } from '../api/external';
+import { extractGithubRepo, fetchBundleSize, fetchLibrariesIoInfo, fetchPackageFileList, fetchRepologyRepos, fetchRepoStats, isLibrariesIoEnabled } from '../api/external';
+import { detectNativeFromFileList, mergeNativeDetections } from '../graph/native';
 import type { GraphNodeData } from '../graph/resolver';
 
 const ENRICHMENT_CONCURRENCY = 6;
@@ -36,6 +37,24 @@ export async function enrichWithExternalMetadata(
             if (node.source === 'npm') {
                 tasks.push(fetchBundleSize(node.pkgName, node.version, signal).then(size => {
                     if (size) node.bundleSize = size;
+                }));
+                // File-listing pass catches .wasm/.node payloads that leave
+                // no trace in registry metadata (e.g. @dqbd/tiktoken)
+                tasks.push(fetchPackageFileList(node.pkgName, node.version, signal).then(listing => {
+                    if (!listing) return;
+                    const detected = detectNativeFromFileList(listing.paths);
+                    if (detected.kinds.length === 0) return;
+                    const merged = mergeNativeDetections(
+                        { kinds: node.nativeKinds || [], details: node.nativeDetails || [] },
+                        detected
+                    );
+                    node.nativeKinds = merged.kinds;
+                    node.nativeDetails = merged.details;
+                    node.nativeArtifacts = {
+                        wasm: listing.paths.filter(p => /\.wasm$/i.test(p)).slice(0, 20),
+                        addons: listing.paths.filter(p => /\.node$/i.test(p)).slice(0, 20),
+                        other: listing.paths.filter(p => /\.(so|dylib|dll)$/i.test(p) || /(^|\/)binding\.gyp$/i.test(p)).slice(0, 20)
+                    };
                 }));
             }
 

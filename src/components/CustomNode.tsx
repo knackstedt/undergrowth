@@ -1,7 +1,7 @@
 import { Handle, Position } from '@xyflow/react';
 import clsx from 'classnames';
 import { flip, FloatingPortal, offset, safePolygon, shift, size, useFloating, useHover, useInteractions } from '@floating-ui/react';
-import { AlertTriangle, CircleAlert, ExternalLink, GitBranch, Github, Gitlab, Loader2, Package } from 'lucide-react';
+import { AlertTriangle, Binary, CircleAlert, Cpu, ExternalLink, GitBranch, Github, Gitlab, Loader2, Package, Terminal } from 'lucide-react';
 import { memo, useCallback, useState } from 'react';
 import type { DependencySource, GraphNodeData } from '../graph/resolver';
 import { MICROPACKAGE_SIZE_THRESHOLD } from '../graph/resolver';
@@ -327,6 +327,12 @@ export const CustomNode = memo(function CustomNode({ data, selected, positionAbs
         if (isPeer) statuses.push('🔗 Peer Dependency');
         if (isPythonRoot) statuses.push('🐍 Python Root Package');
         if (isSearchMatch) statuses.push('🔍 Search match');
+        if (data.cliCommands && data.cliCommands.length > 0) {
+            statuses.push(`⌨️ CLI: ${data.cliCommands.slice(0, 4).join(', ')}${data.cliCommands.length > 4 ? ` +${data.cliCommands.length - 4}` : ''}`);
+        }
+        for (const detail of data.nativeDetails || []) {
+            statuses.push(`🔧 ${detail}`);
+        }
 
         // Active warning highlights
         if (hasWarning) {
@@ -683,6 +689,15 @@ export const CustomNode = memo(function CustomNode({ data, selected, positionAbs
                 <div style={{ fontWeight: 600, color: 'var(--text-primary)', fontSize: '15px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flex: 1 }}>
                     {data.pkgName}
                 </div>
+                {data.nativeKinds?.includes('wasm') && (
+                    <Binary size={14} color="var(--accent-violet)" style={{ flexShrink: 0 }} aria-label="WASM" />
+                )}
+                {data.nativeKinds?.some(k => k !== 'wasm') && (
+                    <Cpu size={14} color="var(--accent-amber)" style={{ flexShrink: 0 }} aria-label="Native code" />
+                )}
+                {data.cliCommands && data.cliCommands.length > 0 && (
+                    <Terminal size={14} color="var(--accent-cyan)" style={{ flexShrink: 0 }} aria-label="CLI" />
+                )}
             </div>
 
             <div style={{ fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '12px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>

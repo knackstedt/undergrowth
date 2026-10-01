@@ -1,6 +1,7 @@
 import { fetchPackageMeta } from '../api/npm';
 import { enrichBulkWithDepsDevData } from '../utils/depsdev-enrichment';
 import { AbortedError } from '../utils/retry';
+import { detectNativeFromPackument, getCliCommands, type NativeKind } from './native';
 import { isPrerelease } from './timeline';
 
 export type DependencySource = 'npm' | 'pypi' | 'crates' | 'go' | 'nuget' | 'github' | 'gitlab' | 'bitbucket' | 'external' | 'other';
@@ -58,6 +59,14 @@ export interface GraphNodeData {
     distroRepos?: string[];
     /** Metrics from libraries.io (only when an API key is configured) */
     librariesIo?: { dependents?: number; stars?: number; rank?: number; };
+    /** Published CLI commands (from the package.json `bin` field) */
+    cliCommands?: string[];
+    /** Native/wasm traits detected from registry metadata + file listings */
+    nativeKinds?: NativeKind[];
+    /** Human-readable evidence for each detected native trait */
+    nativeDetails?: string[];
+    /** Native artifact paths found in the published tarball (unpkg file listing) */
+    nativeArtifacts?: { wasm: string[]; addons: string[]; other: string[]; };
 }
 
 /** Size threshold for micropackages in bytes (6KB default) */
@@ -441,6 +450,9 @@ async function runBfsResolution(
                 ? size < MICROPACKAGE_SIZE_THRESHOLD
                 : (fileCount !== undefined && fileCount > 0 && fileCount <= 3);
 
+            const cliCommands = getCliCommands(pkgData.bin);
+            const native = detectNativeFromPackument(pkgData);
+
             graph.nodes.set(nodeId, {
                 id: nodeId,
                 pkgName: name,
@@ -463,7 +475,10 @@ async function runBfsResolution(
                 latestVersion: newerVersions.length > 0 ? newerVersions[newerVersions.length - 1] : undefined,
                 newerVersions: newerVersions.length > 0 ? newerVersions : undefined,
                 prereleaseVersions: prereleaseVersions.length > 0 ? prereleaseVersions : undefined,
-                isMicropackage
+                isMicropackage,
+                cliCommands: cliCommands.length > 0 ? cliCommands : undefined,
+                nativeKinds: native.kinds.length > 0 ? native.kinds : undefined,
+                nativeDetails: native.details.length > 0 ? native.details : undefined
             });
 
             const newDeps = Object.entries(dependencies);
